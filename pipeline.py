@@ -1,8 +1,10 @@
-from functools import lru_cache
+import datetime
 import glob
 import os
+from typing import Dict
 
 import numpy as np
+import pandas as pd
 import parse
 import skimage.exposure
 import yaml
@@ -82,20 +84,48 @@ TMD2META = {
     # "HOUSE_VOLT",
 }
 
+tmd_fn_pat = "{:04d}{:02d}{:02d} {:02d}{:02d}{:02d}.tmd"
+tmd_fn_parser = parse.compile(tmd_fn_pat)
 
-@lru_cache
+
+def parse_tmd_fn(tmd_fn):
+    tmd_basename = os.path.basename(tmd_fn)
+    r: parse.Result = tmd_fn_parser.parse(tmd_basename)  # type: ignore
+    if r is None:
+        raise ValueError(f"Could not parse tmd filename: {tmd_basename}")
+
+    return datetime.datetime(*r)
+
+
 def _read_tmd(tmd_fn):
-    return loki.read_tmd(tmd_fn)
+    tmd = loki.read_tmd(tmd_fn)
+
+    dt = parse_tmd_fn(tmd_fn)
+
+    return dt, {ke: tmd[kl] for ke, kl in TMD2META.items()}
 
 
-def read_telemetry(data_root: str, meta):
-    tmd_fn = os.path.join(
-        data_root, "Telemetrie", f"{meta['object_date']} {meta['object_time']}.tmd"
-    )
-    tmd = _read_tmd(tmd_fn)
+def read_all_telemetry(data_root: str):
+    tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
 
-    # Return merge of existing and new meta
-    return {**meta, **{ke: tmd[kl] for ke, kl in TMD2META.items()}}
+    print("Reading telemetry...")
+
+    telemetry = pd.DataFrame.from_dict(
+        dict(_read_tmd(tmd_fm) for tmd_fm in glob.iglob(tmd_pat)), orient="index"
+    ).sort_index()
+
+    print(telemetry)
+
+    return telemetry
+
+
+def merge_telemetry(meta: Dict, telemetry: pd.DataFrame):
+    # Construct tmd_fn and extract date
+    tmd_fn = "{object_date} {object_time}.tmd".format_map(meta)
+    dt = parse_tmd_fn(tmd_fn)
+
+    (idx,) = telemetry.index.get_indexer([dt], method="nearest")
+    return {**meta, **telemetry.iloc[idx].to_dict()}
 
 
 REQUIRED_SAMPLE_META = [
@@ -199,6 +229,9 @@ def build_pipeline(input, output):
         # Load LOG metadata
         meta = Call(read_log, data_root, meta)
 
+        # Load *all* telemetry data
+        telemetry = Call(read_all_telemetry, data_root)
+
         # Load additional metadata
         meta = Call(update_and_validate_sample_meta, data_root, meta)
 
@@ -226,8 +259,8 @@ def build_pipeline(input, output):
         meta = Call(parse_object_id, object_id, meta)
         del object_id
 
-        # Read telemetry
-        meta = Call(read_telemetry, data_root, meta)
+        # Merge telemetry
+        meta = Call(merge_telemetry, meta, telemetry)
 
         # Read image
         image = ImageReader(img_fn)
@@ -245,8 +278,8 @@ def build_pipeline(input, output):
 
         target_image_fn = Call(lambda meta: f"{meta['object_id']}.jpg", meta)
 
-        # Image enhancement: Stretch contrast
-        image = Call(stretch_contrast, image, 0.02, 0.98)
+        # # Image enhancement: Stretch contrast
+        # image = Call(stretch_contrast, image, 0.01, 0.99)
 
         EcotaxaWriter(target_archive_fn, (target_image_fn, image), meta)
 
