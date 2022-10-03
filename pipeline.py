@@ -1,3 +1,4 @@
+from functools import lru_cache
 import glob
 import os
 
@@ -82,11 +83,16 @@ TMD2META = {
 }
 
 
+@lru_cache
+def _read_tmd(tmd_fn):
+    return loki.read_tmd(tmd_fn)
+
+
 def read_telemetry(data_root: str, meta):
     tmd_fn = os.path.join(
         data_root, "Telemetrie", f"{meta['object_date']} {meta['object_time']}.tmd"
     )
-    tmd = loki.read_tmd(tmd_fn)
+    tmd = _read_tmd(tmd_fn)
 
     # Return merge of existing and new meta
     return {**meta, **{ke: tmd[kl] for ke, kl in TMD2META.items()}}
@@ -221,7 +227,6 @@ def build_pipeline(input, output):
         del object_id
 
         # Read telemetry
-        # TODO: Avoid reading telemetry for every object anew
         meta = Call(read_telemetry, data_root, meta)
 
         # Read image
