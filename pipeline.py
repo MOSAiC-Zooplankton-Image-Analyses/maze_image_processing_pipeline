@@ -1,12 +1,16 @@
 import datetime
 import glob
 import os
+from pathlib import Path
+from tabnanny import verbose
 from typing import Dict
 
 import numpy as np
 import pandas as pd
 import parse
+import PIL.Image
 import skimage.exposure
+from skimage.feature.orb import ORB
 import yaml
 from morphocut import Pipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -14,9 +18,10 @@ from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
 from morphocut.core import Call
 from morphocut.file import Glob
 from morphocut.image import ImageProperties, ImageReader
-from morphocut.stream import Progress, Unpack
+from morphocut.stream import Filter, Progress, Unpack
 
 import loki
+from zoomie2 import DetectDuplicates, StoreDupsets
 
 
 def find_data_roots(project_root):
@@ -114,8 +119,6 @@ def read_all_telemetry(data_root: str):
         dict(_read_tmd(tmd_fm) for tmd_fm in glob.iglob(tmd_pat)), orient="index"
     ).sort_index()
 
-    print(telemetry)
-
     return telemetry
 
 
@@ -165,6 +168,8 @@ def update_and_validate_sample_meta(data_root: str, meta: Dict):
     if missing_keys:
         missing_keys_str = ", ".join(sorted(missing_keys))
 
+        Path(meta_fn).touch()
+
         raise MissingMetaError(
             f"The following fields are missing: {missing_keys_str}.\nSupply them in {meta_fn}"
         )
@@ -175,7 +180,7 @@ def update_and_validate_sample_meta(data_root: str, meta: Dict):
     return meta
 
 
-objid_pattern = "{object_date} {object_time}  {object_milliseconds:03d}  {object_sequence:06d} {object_posx:04d} {object_posy:04d}"
+objid_pattern = "{object_date} {object_time}  {object_milliseconds}  {object_sequence:06d} {object_posx:04d} {object_posy:04d}"
 objid_parser = parse.compile(objid_pattern)
 
 
@@ -196,8 +201,12 @@ def build_segmentation(segmentation_config, image, meta):
     if segmentation_config is None:
         return image, meta
 
-    if segmentation_config == "threshold":
-        mask = image < threshold
+    if "threshold" in segmentation_config:
+        threshold_config = segmentation_config["threshold"]
+        mask = image > threshold_config["threshold"]
+
+        Filter(lambda obj: obj[mask].any())
+
         props = ImageProperties(mask, image)
         return image, CalculateZooProcessFeatures(props, meta, prefix="object_mc_")
 
@@ -243,12 +252,20 @@ def build_pipeline(input, output):
             meta,
         )
 
+        duplicate_dir = Call(
+            lambda meta: os.path.join(
+                output["path"],
+                "LOKI_{sample_station}_{sample_haul}/duplicates".format_map(meta),
+            ),
+            meta,
+        )
+
         Call(print, meta, "\n")
 
         # Find images
         pictures_pat = Call(os.path.join, data_root, "Pictures", "*", "*.bmp")
         # img_fn = Find(pictures_path, [".bmp"])
-        img_fn = Glob(pictures_pat, prefetch=True)
+        img_fn = Glob(pictures_pat, sorted=True)
 
         # Extract object ID
         object_id = Call(
@@ -257,7 +274,6 @@ def build_pipeline(input, output):
 
         # Parse object ID and update metadata
         meta = Call(parse_object_id, object_id, meta)
-        del object_id
 
         # Merge telemetry
         meta = Call(merge_telemetry, meta, telemetry)
@@ -267,21 +283,55 @@ def build_pipeline(input, output):
 
         image, meta = build_segmentation(input.get("segmentation"), image, meta)
 
-        # if segmentation == "threshold":
-        #     # Simple segmentation
-        #     mask = ...
-        #     props = ImageProperties(mask, image)
-        #     meta = CalculateZooProcessFeatures(props, prefix="object_mc_")
-        # else:
-        #     # Assemble and resegment
-        #     image, meta = Resegment()
+        # Filter(meta["object_mc_area"] > 500)
 
-        target_image_fn = Call(lambda meta: f"{meta['object_id']}.jpg", meta)
+        frame_id = Call(
+            lambda meta: "{object_date} {object_time}  {object_milliseconds}".format_map(
+                meta
+            ),
+            meta,
+        )
 
-        # # Image enhancement: Stretch contrast
-        # image = Call(stretch_contrast, image, 0.01, 0.99)
+        detector_extractor = ORB(
+            downscale=1.2,
+            fast_n=9,
+            fast_threshold=0.02,
+            harris_k=0.02,
+            n_keypoints=100,
+            n_scales=8,
+        )
 
-        EcotaxaWriter(target_archive_fn, (target_image_fn, image), meta)
+        # Detect Duplicates (ZOOMIE2)
+        dupset_id = DetectDuplicates(
+            object_id,
+            image,
+            frame_id,
+            detector_extractor=detector_extractor,
+            verbose=True,
+            min_similarity=0.225,
+        )
+
+        StoreDupsets(
+            object_id, dupset_id, image, frame_id, duplicate_dir, save_singletons=True
+        )
+
+        # # if segmentation == "threshold":
+        # #     # Simple segmentation
+        # #     mask = ...
+        # #     props = ImageProperties(mask, image)
+        # #     meta = CalculateZooProcessFeatures(props, prefix="object_mc_")
+        # # else:
+        # #     # Assemble and resegment
+        # #     image, meta = Resegment()
+
+        # target_image_fn = Call(
+        #     output.get("image_fn", "{object_id}.jpg").format_map, meta
+        # )
+
+        # # # Image enhancement: Stretch contrast
+        # # image = Call(stretch_contrast, image, 0.01, 0.99)
+
+        # EcotaxaWriter(target_archive_fn, (target_image_fn, image), meta)
 
         Progress()
 

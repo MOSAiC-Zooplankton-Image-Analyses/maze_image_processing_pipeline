@@ -7,8 +7,8 @@ def german_float(s: str):
 
 TMD_FIELDS = {
     1: ("DEVICE", None),  # Loki-Name
-    5: ("GPS_LONG", None),  # Longitude (GPS or fix),	[+E, -W]
-    6: ("GPS_LAT", None),  # Latitude (GPS or fix),	[+N, -S]
+    5: ("GPS_LONG", german_float),  # Longitude (GPS or fix),	[+E, -W]
+    6: ("GPS_LAT", german_float),  # Latitude (GPS or fix),	[+N, -S]
     10: ("PRESS", german_float),  # Aandera 4017D, Pressure	[kPa]
     11: ("TEMP", german_float),  # Aandera 4017D, Temperature	[°C]
     20: ("OXY_CON", german_float),  # Aandera 4330F, Oxygen concentration	[mg*l^-1]

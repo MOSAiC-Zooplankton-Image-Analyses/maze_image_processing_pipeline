@@ -1,6 +1,7 @@
 from typing import Callable, Mapping
 from marshmallow import Schema, fields, pre_load, post_load, post_dump
 
+
 class DefaultSchema(Schema):
     __default_field__: str
 
@@ -9,6 +10,7 @@ class DefaultSchema(Schema):
         if isinstance(value, Mapping):
             return value
         return {self.__default_field__: value}
+
 
 class ThresholdSegmentation(DefaultSchema):
     __default_field__ = "threshold"
@@ -27,15 +29,20 @@ class LokiInputSchema(Schema):
 class InputSchema(Schema):
     loki = fields.Nested(LokiInputSchema)
 
+
 class EcoTaxaOutputSchema(Schema):
     path = fields.Str()
+    image_fn = fields.Str(required=False)
+
 
 class OutputSchema(Schema):
     ecotaxa = fields.Nested(EcoTaxaOutputSchema)
 
+
 class PipelineSchema(Schema):
     input = fields.Nested(LokiInputSchema, required=True)
     output = fields.Nested(EcoTaxaOutputSchema, required=True)
+
 
 if __name__ == "__main__":
     import sys
@@ -46,5 +53,3 @@ if __name__ == "__main__":
         x = config.load(yaml.safe_load(f))
 
         print(x)
-        
-    
