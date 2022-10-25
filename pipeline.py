@@ -11,6 +11,7 @@ import parse
 import PIL.Image
 import skimage.exposure
 from skimage.feature.orb import ORB
+from timer_cm import Timer
 import yaml
 from morphocut import Pipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -18,7 +19,8 @@ from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
 from morphocut.core import Call
 from morphocut.file import Glob
 from morphocut.image import ImageProperties, ImageReader
-from morphocut.stream import Filter, Progress, Unpack
+from morphocut.stream import Filter, Progress, StreamBuffer, Unpack
+import skimage.filters
 
 import loki
 from zoomie2 import DetectDuplicates, StoreDupsets
@@ -211,6 +213,23 @@ def build_segmentation(segmentation_config, image, meta):
         return image, CalculateZooProcessFeatures(props, meta, prefix="object_mc_")
 
 
+def detector_extractor(img):
+    # img = skimage.transform.rescale(img, 0.75, preserve_range=True)
+    img = skimage.filters.gaussian(img, 0.5, preserve_range=True)
+
+    detector_extractor = ORB(
+        downscale=1.2,
+        fast_n=12,
+        fast_threshold=0.98,
+        harris_k=0.02,
+        n_keypoints=100,
+        n_scales=8,
+    )
+    detector_extractor.detect_and_extract(img)
+
+    return detector_extractor.keypoints, detector_extractor.descriptors
+
+
 def build_pipeline(input, output):
     """
     Args:
@@ -292,16 +311,10 @@ def build_pipeline(input, output):
             meta,
         )
 
-        detector_extractor = ORB(
-            downscale=1.2,
-            fast_n=9,
-            fast_threshold=0.02,
-            harris_k=0.02,
-            n_keypoints=100,
-            n_scales=8,
-        )
+        StreamBuffer(8)
 
         # Detect Duplicates (ZOOMIE2)
+
         dupset_id = DetectDuplicates(
             object_id,
             image,
@@ -309,6 +322,7 @@ def build_pipeline(input, output):
             detector_extractor=detector_extractor,
             verbose=True,
             min_similarity=0.225,
+            n_workers=8,
         )
 
         StoreDupsets(

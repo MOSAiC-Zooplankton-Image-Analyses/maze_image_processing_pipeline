@@ -1,11 +1,12 @@
+from concurrent.futures import Future
 import os
 import os.path
 import warnings
-from typing import Any, Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, Executor
 
 import numpy as np
 import PIL.Image
-import skimage.filters
 from morphocut.core import (
     Node,
     Output,
@@ -20,7 +21,20 @@ from scipy.spatial.distance import cdist
 from skimage.feature import ORB
 from skimage.measure import ransac
 from skimage.transform import EuclideanTransform
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+class DummyExecutor(Executor):
+    def submit(self, fn, *args, **kwargs) -> Future:
+        fut = Future()
+
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+        return fut
 
 
 class _MatchObject:
@@ -85,12 +99,15 @@ def _match_pair(kpd0, kpd1):
     return inliers.mean()
 
 
-class DetectorExtractor(Protocol):
-    descriptors: Any
-    keypoints: Any
+DetectorExtractor = Callable[
+    [np.ndarray], Tuple[Optional[np.ndarray], Optional[np.ndarray]]
+]
 
-    def detect_and_extract(self, image: Any):
-        ...
+
+def default_detector_extractor(img):
+    detector_extractor = ORB()
+    detector_extractor.detect_and_extract(img)
+    return detector_extractor.keypoints, detector_extractor.descriptors
 
 
 class _DuplicateMatcher:
@@ -98,28 +115,33 @@ class _DuplicateMatcher:
         self,
         min_similarity=0.25,
         detector_extractor: Optional[DetectorExtractor] = None,
-        smoothing_sigma=0.5,
         verbose=False,
+        n_workers=None,
     ) -> None:
         self.min_similarity = min_similarity
 
         if detector_extractor is None:
-            detector_extractor = ORB()
+            detector_extractor = default_detector_extractor
 
         self.detector_extractor = detector_extractor
-
-        self.smoothing_sigma = smoothing_sigma
 
         self.verbose = verbose
 
         self._prev_objects = []
-        self._executor = ThreadPoolExecutor(8)
+        self._executor = (
+            DummyExecutor() if n_workers == 1 else ProcessPoolExecutor(n_workers)
+        )  # ThreadPoolExecutor(n_workers)
 
     def match_and_update(self, images: Tuple[Any, np.ndarray]):
-        new_objects = [
-            self._executor.submit(self._make_obj, id, img) for id, img in images
+        # ids, imgs = zip(*images)
+        # new_objects = list(self._executor.map(self._make_obj, ids, imgs))
+        # # new_objects = [self._make_obj(id, img) for id, img in images]
+
+        futures = [
+            (id, self._executor.submit(self.detector_extractor, img))
+            for id, img in images
         ]
-        new_objects = [fut.result() for fut in new_objects]
+        new_objects = [_MatchObject(id, fut.result()) for id, fut in futures]
 
         # Store objects if first frame
         if not self._prev_objects:
@@ -127,10 +149,14 @@ class _DuplicateMatcher:
             return [obj.id for obj in new_objects]
 
         # Match all pairs
+        futures = [
+            (i, j, self._executor.submit(_match_pair, prev.kpd, cur.kpd))
+            for i, prev in enumerate(self._prev_objects)
+            for j, cur in enumerate(new_objects)
+        ]
         sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
-        for i, prev in enumerate(self._prev_objects):
-            for j, cur in enumerate(new_objects):
-                sim_matrix[i, j] = _match_pair(prev.kpd, cur.kpd)
+        for i, j, fut in futures:
+            sim_matrix[i, j] = fut.result()
 
         # Find best-matching pairs
         ii, jj = linear_sum_assignment(sim_matrix, maximize=True)
@@ -150,21 +176,6 @@ class _DuplicateMatcher:
         self._prev_objects = new_objects
         return [obj.id for obj in new_objects]
 
-    def _make_obj(self, id, img):
-        print(f"make {id}")
-        if self.smoothing_sigma > 0.0:
-            img = skimage.filters.gaussian(
-                img, self.smoothing_sigma, preserve_range=True
-            )
-        try:
-            self.detector_extractor.detect_and_extract(img)
-            desc: Optional[np.ndarray] = self.detector_extractor.descriptors
-            kpts: Optional[np.ndarray] = self.detector_extractor.keypoints
-            kpd = kpts, desc
-        except RuntimeError:
-            kpd = None
-        return _MatchObject(id, kpd)
-
 
 @ReturnOutputs
 @Output("dupset_id")
@@ -174,9 +185,10 @@ class DetectDuplicates(Node):
         image_id,
         image,
         groupby,
-        min_similarity=0.226,
+        min_similarity=0.25,
         detector_extractor: Optional[DetectorExtractor] = None,
         verbose=False,
+        n_workers=None,
     ):
         super().__init__()
 
@@ -186,12 +198,14 @@ class DetectDuplicates(Node):
         self.min_similarity = min_similarity
         self.detector_extractor = detector_extractor
         self.verbose = verbose
+        self.n_workers = n_workers
 
     def transform_stream(self, stream: Stream) -> Stream:
         duplicate_matcher = _DuplicateMatcher(
             min_similarity=self.min_similarity,
             detector_extractor=self.detector_extractor,
             verbose=self.verbose,
+            n_workers=self.n_workers,
         )
 
         with closing_if_closable(stream):
