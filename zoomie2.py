@@ -1,8 +1,9 @@
 from concurrent.futures import Future
+import itertools
 import os
 import os.path
 import warnings
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple, TypeVar
 from concurrent.futures import ProcessPoolExecutor, Executor
 
 import numpy as np
@@ -38,9 +39,13 @@ class DummyExecutor(Executor):
 
 
 class _MatchObject:
-    def __init__(self, id, kpd) -> None:
+    def __init__(
+        self, id: Any, img: np.ndarray, score_args: Any, kpd: Any = None
+    ) -> None:
         self.id = id
+        self.img = img
         self.kpd = kpd
+        self.score_args = score_args
 
 
 def match_hungarian(desc0, desc1, metric=None, quantile=0.9):
@@ -61,7 +66,7 @@ def match_hungarian(desc0, desc1, metric=None, quantile=0.9):
     return np.column_stack((ii, jj))
 
 
-def _match_pair(kpd0, kpd1):
+def _calc_match_score(kpd0, kpd1) -> float:
     if kpd0 is None or kpd1 is None:
         return 0
 
@@ -73,7 +78,7 @@ def _match_pair(kpd0, kpd1):
     if matches.shape[0] < 2:
         return 0
 
-    min_samples = min(len(matches) - 1, 2)
+    min_samples = min(len(matches) - 1, 8)
     transform = EuclideanTransform
 
     with warnings.catch_warnings():
@@ -96,7 +101,20 @@ def _match_pair(kpd0, kpd1):
     if inliers is None:
         return 0
 
-    return inliers.mean()
+    return inliers.mean()  # type: ignore
+
+
+def _match_pair(
+    score_fn,
+    prev: _MatchObject,
+    cur: _MatchObject,
+):
+    score = _calc_match_score(prev.kpd, cur.kpd)
+
+    if score_fn is None:
+        return score
+
+    return score_fn(score, prev.score_args, cur.score_args)
 
 
 DetectorExtractor = Callable[
@@ -117,6 +135,8 @@ class _DuplicateMatcher:
         detector_extractor: Optional[DetectorExtractor] = None,
         verbose=False,
         n_workers=None,
+        score_fn=None,
+        pre_score_thr=None,
     ) -> None:
         self.min_similarity = min_similarity
 
@@ -127,33 +147,83 @@ class _DuplicateMatcher:
 
         self.verbose = verbose
 
+        self.score_fn = score_fn
+        self.pre_score_thr = pre_score_thr
+
         self._prev_objects = []
         self._executor = (
             DummyExecutor() if n_workers == 1 else ProcessPoolExecutor(n_workers)
         )  # ThreadPoolExecutor(n_workers)
 
-    def match_and_update(self, images: Tuple[Any, np.ndarray]):
-        # ids, imgs = zip(*images)
-        # new_objects = list(self._executor.map(self._make_obj, ids, imgs))
-        # # new_objects = [self._make_obj(id, img) for id, img in images]
-
-        futures = [
-            (id, self._executor.submit(self.detector_extractor, img))
-            for id, img in images
+    def match_and_update(self, image_ids, images, score_args):
+        new_objects = [
+            _MatchObject(id, img, score_arg)
+            for id, img, score_arg in zip(image_ids, images, score_args)
         ]
-        new_objects = [_MatchObject(id, fut.result()) for id, fut in futures]
 
         # Store objects if first frame
         if not self._prev_objects:
             self._prev_objects = new_objects
             return [obj.id for obj in new_objects]
 
-        # Match all pairs
-        futures = [
-            (i, j, self._executor.submit(_match_pair, prev.kpd, cur.kpd))
-            for i, prev in enumerate(self._prev_objects)
-            for j, cur in enumerate(new_objects)
+        # Find matches quickly without expensive feature calculation
+        prev_matched = set()
+        new_matched = set()
+        if self.score_fn is not None and self.pre_score_thr is not None:
+            sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
+            for i, prev in enumerate(self._prev_objects):
+                for j, cur in enumerate(new_objects):
+                    sim_matrix[i, j] = self.score_fn(0, prev.score_args, cur.score_args)
+
+            # Find best-matching pairs
+            ii, jj = linear_sum_assignment(sim_matrix, maximize=True)
+
+            # Update dupset IDs
+            for i, j in zip(ii, jj):
+                sim = sim_matrix[i, j]
+                if sim >= self.pre_score_thr:
+                    old_id = new_objects[j].id
+                    new_objects[j].id = self._prev_objects[i].id
+                    prev_matched.add(i)
+                    new_matched.add(j)
+
+                    if self.verbose:
+                        print(
+                            f"  '{old_id}' is dup of '{self._prev_objects[i].id}' ({sim_matrix[i, j]:.2f})"
+                        )
+
+        # Calculate features of unmatched objects asynchronously
+        prev_obj_fut = [
+            (obj, self._executor.submit(self.detector_extractor, obj.img))
+            for i, obj in enumerate(self._prev_objects)
+            if i not in prev_matched
+            and obj.kpd is None  # kpd could have been calculated previously
         ]
+
+        new_obj_fut = [
+            (obj, self._executor.submit(self.detector_extractor, obj.img))
+            for j, obj in enumerate(new_objects)
+            if j not in new_matched  # obj.kpd is None anyways
+        ]
+
+        # Update match objects after feature calculation finished
+        for (obj, fut) in itertools.chain(prev_obj_fut, new_obj_fut):
+            obj.kpd = fut.result()
+
+        # Match all pairs of unmatched objects asynchronously
+        futures = [
+            (
+                i,
+                j,
+                self._executor.submit(_match_pair, self.score_fn, prev, cur),
+            )
+            for i, prev in enumerate(self._prev_objects)
+            if i not in prev_matched
+            for j, cur in enumerate(new_objects)
+            if j not in new_matched
+        ]
+
+        # Collect result of matching
         sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
         for i, j, fut in futures:
             sim_matrix[i, j] = fut.result()
@@ -177,6 +247,9 @@ class _DuplicateMatcher:
         return [obj.id for obj in new_objects]
 
 
+T = TypeVar("T")
+
+
 @ReturnOutputs
 @Output("dupset_id")
 class DetectDuplicates(Node):
@@ -185,6 +258,9 @@ class DetectDuplicates(Node):
         image_id,
         image,
         groupby,
+        score_fn: Optional[Callable[[float, T, T], float]] = None,
+        score_arg: RawOrVariable[T] = None,
+        pre_score_thr=None,
         min_similarity=0.25,
         detector_extractor: Optional[DetectorExtractor] = None,
         verbose=False,
@@ -195,6 +271,9 @@ class DetectDuplicates(Node):
         self.image_id = image_id
         self.image = image
         self.groupby = groupby
+        self.score_fn = score_fn
+        self.score_arg = score_arg
+        self.pre_score_thr = pre_score_thr
         self.min_similarity = min_similarity
         self.detector_extractor = detector_extractor
         self.verbose = verbose
@@ -206,15 +285,19 @@ class DetectDuplicates(Node):
             detector_extractor=self.detector_extractor,
             verbose=self.verbose,
             n_workers=self.n_workers,
+            score_fn=self.score_fn,
+            pre_score_thr=self.pre_score_thr,
         )
 
         with closing_if_closable(stream):
             for _, substream in stream_groupby(stream, self.groupby):
-                objs, images, image_ids = zip(*self._complete_substream(substream))
+                objs, images, image_ids, score_args = zip(
+                    *self._complete_substream(substream)
+                )
 
                 # Find matches in frame cache
                 matches = duplicate_matcher.match_and_update(
-                    (id, img) for id, img in zip(image_ids, images)
+                    image_ids, images, score_args
                 )
 
                 for obj, match in zip(objs, matches):
@@ -222,8 +305,10 @@ class DetectDuplicates(Node):
 
     def _complete_substream(self, substream):
         for obj in substream:
-            image, image_id = self.prepare_input(obj, ("image", "image_id"))
-            yield obj, image, image_id
+            image, image_id, score_arg = self.prepare_input(
+                obj, ("image", "image_id", "score_arg")
+            )
+            yield obj, image, image_id, score_arg
 
 
 class StoreDupsets(Node):
@@ -256,7 +341,7 @@ class StoreDupsets(Node):
                         obj, ("image_id", "dupset_id", "image")
                     )
 
-                    dupset_path = os.path.join(output_dir, dupset_id)
+                    dupset_path = os.path.join(output_dir, dupset_id)  # type: ignore
 
                     if image_id == dupset_id:
                         # Save master for later

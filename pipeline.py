@@ -2,8 +2,9 @@ import datetime
 import glob
 import os
 from pathlib import Path
+from shutil import ReadError
 from tabnanny import verbose
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,7 @@ import yaml
 from morphocut import Pipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
 from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
-from morphocut.core import Call
+from morphocut.core import Call, Variable
 from morphocut.file import Glob
 from morphocut.image import ImageProperties, ImageReader
 from morphocut.stream import Filter, Progress, StreamBuffer, Unpack
@@ -30,6 +31,7 @@ def find_data_roots(project_root):
     for root, dirs, _ in os.walk(project_root):
         if "Pictures" in dirs and "Telemetrie" in dirs:
             yield root
+            # Do not descend further
             dirs[:] = []
 
 
@@ -105,7 +107,11 @@ def parse_tmd_fn(tmd_fn):
 
 
 def _read_tmd(tmd_fn):
-    tmd = loki.read_tmd(tmd_fn)
+    try:
+        tmd = loki.read_tmd(tmd_fn)
+    except:
+        print(f"Error reading {tmd_fn}")
+        raise
 
     dt = parse_tmd_fn(tmd_fn)
 
@@ -199,8 +205,17 @@ def stretch_contrast(image, low, high):
     return skimage.exposure.rescale_intensity(image, (low_, high_))
 
 
-def build_segmentation(segmentation_config, image, meta):
+def build_segmentation(segmentation_config, image, meta) -> Tuple[Variable, Variable]:
     if segmentation_config is None:
+        meta = Call(
+            lambda image, meta: {
+                **meta,
+                "object_height": image.shape[0],
+                "object_width": image.shape[1],
+            },
+            image,
+            meta,
+        )
         return image, meta
 
     if "threshold" in segmentation_config:
@@ -210,7 +225,8 @@ def build_segmentation(segmentation_config, image, meta):
         Filter(lambda obj: obj[mask].any())
 
         props = ImageProperties(mask, image)
-        return image, CalculateZooProcessFeatures(props, meta, prefix="object_mc_")
+        meta = CalculateZooProcessFeatures(props, meta, prefix="object_")
+        return image, meta
 
 
 def detector_extractor(img):
@@ -220,7 +236,7 @@ def detector_extractor(img):
     detector_extractor = ORB(
         downscale=1.2,
         fast_n=12,
-        fast_threshold=0.98,
+        fast_threshold=0.84,
         harris_k=0.02,
         n_keypoints=100,
         n_scales=8,
@@ -228,6 +244,51 @@ def detector_extractor(img):
     detector_extractor.detect_and_extract(img)
 
     return detector_extractor.keypoints, detector_extractor.descriptors
+
+
+def calc_overlap(xy0, wh0, xy1, wh1):
+
+    l0 = xy0[0]
+    r0 = xy0[0] + wh0[0]
+
+    l1 = xy1[0]
+    r1 = xy1[0] + wh1[0]
+
+    t0 = xy0[1]
+    b0 = xy0[1] + wh0[1]
+
+    t1 = xy1[1]
+    b1 = xy1[1] + wh1[1]
+
+    w0, h0 = wh0
+    w1, h1 = wh0
+
+    intersect_x = max(0, min(r0, r1) - max(l0, l1))
+    intersect_y = max(0, min(b0, b1) - max(t0, t1))
+
+    union_x = max(1, max(r0, r1) - min(l0, l1))
+    union_y = max(1, max(b0, b1) - min(t0, t1))
+
+    overlap_x = intersect_x / union_x
+    overlap_y = intersect_y / union_y
+
+    intersect_xy = intersect_x * intersect_y
+    overlap_xy = intersect_xy / (w0 * h0 + w1 * h1 - intersect_xy)
+
+    return overlap_x, overlap_y, overlap_xy
+
+
+def score_fn(score, meta0, meta1):
+    """overlap_xy OR (keypoint_score AND overlap_y)"""
+
+    xy0 = meta0["object_posx"], meta0["object_posy"]
+    xy1 = meta1["object_posx"], meta1["object_posy"]
+    wh0 = meta0["object_width"], meta0["object_height"]
+    wh1 = meta1["object_width"], meta1["object_height"]
+
+    overlap_x, overlap_y, overlap_xy = calc_overlap(xy0, wh0, xy1, wh1)
+
+    return max(overlap_xy, min(score, overlap_y))
 
 
 def build_pipeline(input, output):
@@ -247,7 +308,7 @@ def build_pipeline(input, output):
     # List directories that contain "Pictures" and "Telemetrie" folders
     data_roots = list(find_data_roots(input["path"]))
 
-    print(f"Found {len(data_roots):d} input directories.")
+    print(f"Found {len(data_roots):d} input directories below {input['path']}")
 
     with Pipeline() as p:
         data_root = Unpack(data_roots)
@@ -257,8 +318,8 @@ def build_pipeline(input, output):
         # Load LOG metadata
         meta = Call(read_log, data_root, meta)
 
-        # Load *all* telemetry data
-        telemetry = Call(read_all_telemetry, data_root)
+        # # Load *all* telemetry data
+        # telemetry = Call(read_all_telemetry, data_root)
 
         # Load additional metadata
         meta = Call(update_and_validate_sample_meta, data_root, meta)
@@ -274,7 +335,9 @@ def build_pipeline(input, output):
         duplicate_dir = Call(
             lambda meta: os.path.join(
                 output["path"],
-                "LOKI_{sample_station}_{sample_haul}/duplicates".format_map(meta),
+                f"{datetime.datetime.now():%y-%m-%d}-"
+                + "LOKI_{sample_station}_{sample_haul}".format_map(meta),
+                "duplicates",
             ),
             meta,
         )
@@ -294,8 +357,8 @@ def build_pipeline(input, output):
         # Parse object ID and update metadata
         meta = Call(parse_object_id, object_id, meta)
 
-        # Merge telemetry
-        meta = Call(merge_telemetry, meta, telemetry)
+        # # Merge telemetry
+        # meta = Call(merge_telemetry, meta, telemetry)
 
         # Read image
         image = ImageReader(img_fn)
@@ -319,10 +382,14 @@ def build_pipeline(input, output):
             object_id,
             image,
             frame_id,
+            score_fn=score_fn,
+            score_arg=meta,
             detector_extractor=detector_extractor,
             verbose=True,
-            min_similarity=0.225,
-            n_workers=8,
+            min_similarity=0.5,
+            # n_workers=8,
+            n_workers=1,
+            pre_score_thr=0.75,
         )
 
         StoreDupsets(
