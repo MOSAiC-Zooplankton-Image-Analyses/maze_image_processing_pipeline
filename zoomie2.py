@@ -46,6 +46,11 @@ class _MatchObject:
         self.img = img
         self.kpd = kpd
         self.score_args = score_args
+        self.age = 0
+
+    def inc_age(self):
+        self.age += 1
+        return self.age
 
 
 def match_hungarian(desc0, desc1, metric=None, quantile=0.9):
@@ -137,6 +142,7 @@ class _DuplicateMatcher:
         n_workers=None,
         score_fn=None,
         pre_score_thr=None,
+        max_age=1,
     ) -> None:
         self.min_similarity = min_similarity
 
@@ -149,6 +155,8 @@ class _DuplicateMatcher:
 
         self.score_fn = score_fn
         self.pre_score_thr = pre_score_thr
+
+        self.max_age = max_age
 
         self._prev_objects = []
         self._executor = (
@@ -243,7 +251,13 @@ class _DuplicateMatcher:
                         f"  '{old_id}' is dup of '{self._prev_objects[i].id}' ({sim_matrix[i, j]:.2f})"
                     )
 
-        self._prev_objects = new_objects
+        # Update previously seen objects
+        prev_objects = {
+            obj.id: obj for obj in self._prev_objects if obj.inc_age() <= self.max_age
+        }
+        prev_objects.update({obj.id: obj for obj in new_objects})
+        self._prev_objects = [obj for obj in prev_objects.values()]
+
         return [obj.id for obj in new_objects]
 
 
@@ -263,6 +277,7 @@ class DetectDuplicates(Node):
         pre_score_thr=None,
         min_similarity=0.25,
         detector_extractor: Optional[DetectorExtractor] = None,
+        max_age=1,
         verbose=False,
         n_workers=None,
     ):
@@ -278,6 +293,7 @@ class DetectDuplicates(Node):
         self.detector_extractor = detector_extractor
         self.verbose = verbose
         self.n_workers = n_workers
+        self.max_age = max_age
 
     def transform_stream(self, stream: Stream) -> Stream:
         duplicate_matcher = _DuplicateMatcher(
@@ -287,6 +303,7 @@ class DetectDuplicates(Node):
             n_workers=self.n_workers,
             score_fn=self.score_fn,
             pre_score_thr=self.pre_score_thr,
+            max_age=self.max_age,
         )
 
         with closing_if_closable(stream):

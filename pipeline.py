@@ -387,9 +387,10 @@ def build_pipeline(input, output):
             detector_extractor=detector_extractor,
             verbose=True,
             min_similarity=0.5,
-            # n_workers=8,
-            n_workers=1,
+            n_workers=8,
+            # n_workers=1,
             pre_score_thr=0.75,
+            max_age=24,
         )
 
         StoreDupsets(
