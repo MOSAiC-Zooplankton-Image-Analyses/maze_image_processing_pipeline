@@ -7,7 +7,7 @@ def german_float(s: str):
 
 TMD_FIELDS = {
     1: ("DEVICE", None),  # Loki-Name
-    5: ("GPS_LONG", german_float),  # Longitude (GPS or fix),	[+E, -W]
+    5: ("GPS_LON", german_float),  # Longitude (GPS or fix),	[+E, -W]
     6: ("GPS_LAT", german_float),  # Latitude (GPS or fix),	[+N, -S]
     10: ("PRESS", german_float),  # Aandera 4017D, Pressure	[kPa]
     11: ("TEMP", german_float),  # Aandera 4017D, Temperature	[°C]
@@ -37,6 +37,32 @@ TMD_FIELDS = {
     243: ("HOUSE_VOLT", german_float),  # Housekeeping voltage	[V]
 }
 
+DAT_FIELDS = {
+    1: ("FW_REV", None),  # Firmware version
+    2: ("COND_SSPEED", float),  # Speed of sound
+    3: ("COND_DENS", float),  # Density
+    4: ("COND_TEMP", float),  # Temperature
+    5: ("COND_COND", float),  # Conductivity
+    6: ("COND_SALY", float),  # Salinity
+    7: ("OXY_CON", float),  # Oxygen concentration
+    8: ("OXY_SAT", float),  # Oxygen saturation
+    9: ("OXY_TEMP", float),  # Temperature
+    10: ("HOUSE_T1", float),  # Housekeeping temperature
+    11: ("HOUSE_VOLT", float),  # Housekeeping  voltage
+    16: ("FLOUR_1", float),  # Fluorescence
+    17: ("UNKNOWN", None),  # ??
+    18: ("UNKNOWN", None),  # ??
+    19: ("UNKNOWN", None),  # ??
+    20: ("PRESS", float),  # Pressure
+    21: ("TEMP", float),  # Temperature
+    22: ("UNKNOWN", None),  # ??
+    23: ("LOKI_REC", None),  # Recorder status
+    24: ("LOKI_PIC", None),  # Picture #
+    25: ("LOKI_FRAME", None),  # Frame rate
+    26: ("GPS_LAT", float),  # Position Latitute
+    27: ("GPS_LON", float),  # Position Longitude
+}
+
 LOG_FIELDS = {
     1: ("DATE", None),  # Startdate	UTC
     2: ("TIME", None),  # Starttime	UTC
@@ -55,7 +81,7 @@ LOG_FIELDS = {
     15: ("SHIP_STAT", None),  # State of Registry
     16: ("SHIP_AFF", None),  # Ship affiliation
     17: ("GPS_SRC", None),  # GPS Source (0 = NoGPS, 1 = Fixed, 2 = Ext.)
-    18: ("FIX_LONG", german_float),  # Fixed Longitude	[+E, -W]
+    18: ("FIX_LON", german_float),  # Fixed Longitude	[+E, -W]
     19: ("FIX_LAT", german_float),  # Fixed Latitude	[+N, -S]
     20: ("TEMP_INDEX", None),  # Temperature Sensor Index for calculation
     61: ("ERROR", None),  # Any Error Message
@@ -65,7 +91,7 @@ LOG_FIELDS = {
 }
 
 
-def _parse_line(line: str, fields) -> Tuple[str, Any]:
+def _parse_tmd_line(line: str, fields) -> Tuple[str, Any]:
     idx, value = line.rstrip("\n").split(";", 1)
     name, converter = fields[int(idx)]
     if converter is not None:
@@ -77,11 +103,38 @@ def _parse_line(line: str, fields) -> Tuple[str, Any]:
     return name, value
 
 
+def _parse_dat_line(idx: int, line: str, fields) -> Tuple[str, Any]:
+    value = line.rstrip("\n")
+
+    name, converter = fields[idx]
+
+    if converter is not None:
+        try:
+            value = converter(value)
+        except Exception as exc:
+            raise type(exc)(*exc.args, f"Field {name}")
+
+    return name, value
+
+
 def read_tmd(fn):
     with open(fn, "r") as f:
-        return dict(_parse_line(l, TMD_FIELDS) for l in f)
+        return dict(_parse_tmd_line(l, TMD_FIELDS) for l in f)
+
+
+def read_dat(fn):
+    with open(fn, "r") as f:
+        contents = f.read()
+
+    fields = contents.split("\t")
+
+    return dict(
+        _parse_dat_line(i, f, DAT_FIELDS)
+        for i, f in enumerate(fields, 1)
+        if i in DAT_FIELDS
+    )
 
 
 def read_log(fn):
     with open(fn, "r") as f:
-        return dict(_parse_line(l, LOG_FIELDS) for l in f)
+        return dict(_parse_tmd_line(l, LOG_FIELDS) for l in f)

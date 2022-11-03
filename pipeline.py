@@ -48,7 +48,7 @@ LOG2META = {
     "sample_vessel": "SHIP",
     "sample_gps_src": "GPS_SRC",
     "sample_latitude": "FIX_LAT",
-    "sample_longitude": "FIX_LONG",
+    "sample_longitude": "FIX_LON",
 }
 
 
@@ -63,7 +63,7 @@ def read_log(data_root: str, meta):
 
 
 TMD2META = {
-    "object_longitude": "GPS_LONG",
+    "object_longitude": "GPS_LON",
     "object_latitude": "GPS_LAT",
     "object_pressure": "PRESS",
     "object_temperature": "TEMP",  # or OXY_TEMP?
@@ -93,15 +93,15 @@ TMD2META = {
     # "HOUSE_VOLT",
 }
 
-tmd_fn_pat = "{:04d}{:02d}{:02d} {:02d}{:02d}{:02d}.tmd"
-tmd_fn_parser = parse.compile(tmd_fn_pat)
+tmd_fn_pat = "{:04d}{:02d}{:02d} {:02d}{:02d}{:02d}"
+telemetry_fn_parser = parse.compile(tmd_fn_pat)
 
 
-def parse_tmd_fn(tmd_fn):
+def parse_telemetry_fn(tmd_fn):
     tmd_basename = os.path.basename(tmd_fn)
-    r: parse.Result = tmd_fn_parser.parse(tmd_basename)  # type: ignore
+    r: parse.Result = telemetry_fn_parser.search(tmd_basename)  # type: ignore
     if r is None:
-        raise ValueError(f"Could not parse tmd filename: {tmd_basename}")
+        raise ValueError(f"Could not parse telemetry filename: {tmd_basename}")
 
     return datetime.datetime(*r)
 
@@ -113,27 +113,47 @@ def _read_tmd(tmd_fn):
         print(f"Error reading {tmd_fn}")
         raise
 
-    dt = parse_tmd_fn(tmd_fn)
+    dt = parse_telemetry_fn(tmd_fn)
 
     return dt, {ke: tmd[kl] for ke, kl in TMD2META.items()}
 
 
-def read_all_telemetry(data_root: str):
-    tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
+def _read_dat(dat_fn):
+    try:
+        dat = loki.read_dat(dat_fn)
+    except:
+        print(f"Error reading {dat_fn}")
+        raise
 
+    dt = parse_telemetry_fn(dat_fn)
+
+    return dt, {ke: dat[kl] for ke, kl in TMD2META.items()}
+
+
+def read_all_telemetry(data_root: str):
     print("Reading telemetry...")
 
+    tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
     telemetry = pd.DataFrame.from_dict(
         dict(_read_tmd(tmd_fm) for tmd_fm in glob.iglob(tmd_pat)), orient="index"
-    ).sort_index()
+    )
 
-    return telemetry
+    # Also read .dat files
+    dat_pat = os.path.join(data_root, "Telemetrie", "*.dat")
+    dat = pd.DataFrame.from_dict(
+        dict(_read_dat(dat_fm) for dat_fm in glob.iglob(dat_pat)), orient="index"
+    )
+    dat = dat[~dat.index.isin(telemetry.index)]
+    if not dat.empty:
+        telemetry = pd.concat((telemetry, dat))
+
+    return telemetry.sort_index()
 
 
 def merge_telemetry(meta: Dict, telemetry: pd.DataFrame):
     # Construct tmd_fn and extract date
     tmd_fn = "{object_date} {object_time}.tmd".format_map(meta)
-    dt = parse_tmd_fn(tmd_fn)
+    dt = parse_telemetry_fn(tmd_fn)
 
     (idx,) = telemetry.index.get_indexer([dt], method="nearest")
     return {**meta, **telemetry.iloc[idx].to_dict()}
