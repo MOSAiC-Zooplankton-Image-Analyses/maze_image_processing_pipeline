@@ -40,7 +40,11 @@ class DummyExecutor(Executor):
 
 class _MatchObject:
     def __init__(
-        self, id: Any, img: np.ndarray, score_args: Any, kpd: Any = None
+        self,
+        id: Any,
+        score_args: Any,
+        img: Optional[np.ndarray] = None,
+        kpd: Any = None,
     ) -> None:
         self.id = id
         self.img = img
@@ -165,7 +169,7 @@ class _DuplicateMatcher:
 
     def match_and_update(self, image_ids, images, score_args):
         new_objects = [
-            _MatchObject(id, img, score_arg)
+            _MatchObject(id, score_arg, img=img)
             for id, img, score_arg in zip(image_ids, images, score_args)
         ]
 
@@ -326,6 +330,111 @@ class DetectDuplicates(Node):
                 obj, ("image", "image_id", "score_arg")
             )
             yield obj, image, image_id, score_arg
+
+
+class _DuplicateMatcherSimple:
+    def __init__(
+        self,
+        *,
+        score_fn,
+        min_similarity,
+        verbose,
+        max_age,
+    ) -> None:
+        self.score_fn = score_fn
+        self.min_similarity = min_similarity
+        self.verbose = verbose
+        self.max_age = max_age
+
+        self._prev_objects = []
+
+    def match_and_update(self, image_ids, score_args):
+        new_objects = [
+            _MatchObject(id, score_arg)
+            for id, score_arg in zip(image_ids, score_args)
+        ]
+
+        # Store objects if first frame
+        if not self._prev_objects:
+            self._prev_objects = new_objects
+            return [obj.id for obj in new_objects]
+
+        # Find matches
+        sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
+        for i, prev in enumerate(self._prev_objects):
+            for j, cur in enumerate(new_objects):
+                sim_matrix[i, j] = self.score_fn(prev.score_args, cur.score_args)
+
+        # Find best-matching pairs
+        ii, jj = linear_sum_assignment(sim_matrix, maximize=True)
+
+        # Update dupset IDs
+        for i, j in zip(ii, jj):
+            sim = sim_matrix[i, j]
+            if sim >= self.min_similarity:
+                old_id = new_objects[j].id
+                new_objects[j].id = self._prev_objects[i].id
+
+                if self.verbose:
+                    print(
+                        f"  '{old_id}' is dup of '{self._prev_objects[i].id}' ({sim_matrix[i, j]:.2f})"
+                    )
+
+        # Update previously seen objects
+        prev_objects = {
+            obj.id: obj for obj in self._prev_objects if obj.inc_age() <= self.max_age
+        }
+        prev_objects.update({obj.id: obj for obj in new_objects})
+        self._prev_objects = [obj for obj in prev_objects.values()]
+
+        return [obj.id for obj in new_objects]
+
+
+@ReturnOutputs
+@Output("dupset_id")
+class DetectDuplicatesSimple(Node):
+    def __init__(
+        self,
+        groupby,
+        image_id,
+        score_fn: Optional[Callable[[T, T], float]] = None,
+        score_arg: RawOrVariable[T] = None,
+        min_similarity=0.95,
+        max_age=1,
+        verbose=False,
+    ):
+        super().__init__()
+
+        self.groupby = groupby
+        self.image_id = image_id
+        self.score_fn = score_fn
+        self.score_arg = score_arg
+        self.min_similarity = min_similarity
+        self.verbose = verbose
+        self.max_age = max_age
+
+    def transform_stream(self, stream: Stream) -> Stream:
+        duplicate_matcher = _DuplicateMatcherSimple(
+            score_fn=self.score_fn,
+            min_similarity=self.min_similarity,
+            verbose=self.verbose,
+            max_age=self.max_age,
+        )
+
+        with closing_if_closable(stream):
+            for _, substream in stream_groupby(stream, self.groupby):
+                objs, image_ids, score_args = zip(*self._complete_substream(substream))
+
+                # Find matches in frame cache
+                matches = duplicate_matcher.match_and_update(image_ids, score_args)
+
+                for obj, match in zip(objs, matches):
+                    yield self.prepare_output(obj, match)
+
+    def _complete_substream(self, substream):
+        for obj in substream:
+            image_id, score_arg = self.prepare_input(obj, ("image_id", "score_arg"))
+            yield obj, image_id, score_arg
 
 
 class StoreDupsets(Node):

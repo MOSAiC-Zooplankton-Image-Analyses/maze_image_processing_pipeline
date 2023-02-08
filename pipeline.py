@@ -1,33 +1,54 @@
 import datetime
 import glob
+import gzip
 import os
+import pickle
+import queue
+import threading
+import traceback
 from pathlib import Path
-from shutil import ReadError
-from tabnanny import verbose
-from typing import Dict, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import parse
-import PIL.Image
+import skimage.color
 import skimage.exposure
-from skimage.feature.orb import ORB
-from timer_cm import Timer
+import skimage.filters
+import skimage.morphology
 import yaml
 from morphocut import Pipeline
+from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
 from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
-from morphocut.core import Call, Variable
+from morphocut.core import (
+    Call,
+    Node,
+    Output,
+    ReturnOutputs,
+    Stream,
+    StreamObject,
+    StreamTransformer,
+    Variable,
+    check_stream,
+    closing_if_closable,
+)
 from morphocut.file import Glob
-from morphocut.image import ImageProperties, ImageReader
-from morphocut.stream import Filter, Progress, StreamBuffer, Unpack
-import skimage.filters
+from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
+from morphocut.pipelines import DataParallelPipeline, MergeNodesPipeline
+from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
+from morphocut.tiles import TiledPipeline
+from morphocut.torch import PyTorch
+from morphocut.utils import StreamEstimator, stream_groupby
+from skimage.feature.orb import ORB
+from skimage.measure._regionprops import RegionProperties
 
 import loki
-from zoomie2 import DetectDuplicates, StoreDupsets
+import segmenter
 
 
 def find_data_roots(project_root):
+    print("Detecting project folders...")
     for root, dirs, _ in os.walk(project_root):
         if "Pictures" in dirs and "Telemetrie" in dirs:
             yield root
@@ -217,7 +238,16 @@ def parse_object_id(object_id, meta):
     if result is None:
         raise ValueError(f"Can not parse object ID: {object_id}")
 
-    return {**meta, "object_id": object_id, **result.named}
+    object_frame_id = "{object_date} {object_time}  {object_milliseconds}".format_map(
+        result.named
+    )
+
+    return {
+        **meta,
+        "object_id": object_id,
+        "object_frame_id": object_frame_id,
+        **result.named,
+    }
 
 
 def stretch_contrast(image, low, high):
@@ -225,17 +255,245 @@ def stretch_contrast(image, low, high):
     return skimage.exposure.rescale_intensity(image, (low_, high_))
 
 
+def build_stored_segmentation(stored_config, image, meta):
+    pickle_fn = stored_config["pickle_fn"]
+
+    with gzip.open(pickle_fn, "rb") as f:
+        segmenter_: segmenter.Segmenter = pickle.load(f)
+    segmenter_.configure(n_jobs=1, verbose=0)
+
+    def _predict_scores(image, segmenter_):
+        features = segmenter_.extract_features(image)
+        mask = segmenter_.preselect(image)
+        scores = segmenter_.predict_pixels(features, mask)
+
+        return scores
+
+    scores = Call(_predict_scores, image, segmenter_)
+
+    stitched = Stitch(
+        image,
+        scores,
+        groupby=meta["object_frame_id"],
+        x=meta["object_posx"],
+        y=meta["object_posy"],
+        skip_single=stored_config["skip_single"],
+    )
+
+    image_large, scores_large = stitched.unpack(2)
+
+    labels_large = Call(segmenter_.postprocess, scores_large, image_large)
+
+    if stored_config["full_frame_archive_fn"] is not None:
+        segment_image = Call(
+            lambda labels, image: skimage.util.img_as_ubyte(
+                skimage.color.label2rgb(labels, image, bg_label=0, bg_color=None)
+            ),
+            labels_large,
+            image_large,
+        )
+
+        score_image = Call(
+            skimage.util.img_as_ubyte,
+            scores_large,
+        )
+
+        full_frame_archive_fn = Call(
+            str.format_map, stored_config["full_frame_archive_fn"], meta
+        )
+
+        #  Store stitched result
+        EcotaxaWriter(
+            full_frame_archive_fn,
+            [
+                # Input image
+                ("img/" + meta["object_frame_id"] + ".png", image_large),
+                # Image overlayed with labeled segments
+                ("overlay/" + meta["object_frame_id"] + ".png", segment_image),
+                ("score/" + meta["object_frame_id"] + ".png", score_image),
+                # # Mask (255=foreground)
+                # (
+                #     "mask/" + meta["object_frame_id"] + ".png",
+                #     Call(lambda labels: (labels > 0).astype("uint8")*255, labels_large),
+                # ),
+            ],
+        )
+
+    # Extract individual objects
+    region = FindRegions(labels_large, image_large, padding=75)
+
+    image = ExtractROI(image_large, region)
+
+    def recalc_metadata(region: RegionProperties, meta):
+        meta = meta.copy()
+
+        (y0, x0, x1, y1) = region.bbox
+
+        meta["object_posx"] = x0
+        meta["object_posy"] = y0
+        meta["object_sequence"] = region.label
+        meta["object_width"] = x1 - x0
+        meta["object_height"] = y1 - y0
+
+        meta["object_id"] = objid_pattern.format_map(meta)
+
+        return meta
+
+    # Re-calculate metadata (object_id, posx, posy)
+    meta = Call(recalc_metadata, region, meta)
+
+    # Re-calculate features
+    meta = CalculateZooProcessFeatures(region, meta, prefix="object_")
+    return image, meta
+
+
+def assert_compatible_shape(label, image):
+    try:
+        assert (
+            image.shape[: label.ndim] == label.shape
+        ), f"{label.shape} vs. {image.shape}"
+    except:
+        print(f"{label.shape} vs. {image.shape}")
+        raise
+
+
+def build_pytorch_segmentation(config: Mapping, image, meta):
+    import torch
+    import torch.jit
+    import torchvision.transforms.functional as tvtf
+
+    device = config["device"]
+
+    if config.get("model_fn"):
+        model = torch.load(config.get("model_fn"), map_location=device)
+    elif config.get("jit_model_fn"):
+        model = torch.jit.load(config.get("jit_model_fn"), map_location=device)
+    else:
+        raise ValueError("No model fn")
+
+    StreamBuffer(16)
+
+    image = Stitch(
+        image,
+        groupby=meta["object_frame_id"],
+        x=meta["object_posx"],
+        y=meta["object_posy"],
+        skip_single=config["skip_single"],
+    ).unpack(1)
+
+    def prepare(img):
+        if img.ndim == 2:
+            img = skimage.color.gray2rgb(img)
+        return tvtf.to_tensor(img)
+
+    with TiledPipeline((1024, 1024), image, tile_stride=(896, 896)):
+        # # Skip empty tiles
+        # Filter(lambda obj: (obj[image] > 0).any())
+        # TODO: Rework Filter
+        # Filter(lambda image: (image > 0).any(), image)
+        Filter(Call(lambda image: (image > 0).any(), image))
+
+        # Each model execution starts processes. Reduce overhead by increasing batch size?
+        with DataParallelPipeline(executor=16):
+            foreground_pred_large = PyTorch(
+                model,
+                image,
+                device=device,
+                output_key=0,
+                prepare=prepare,
+                pin_memory=True,
+            )
+
+            # # Dummy for speed optimization
+            # foreground_pred_large = Call(
+            #     lambda image: np.zeros(image.shape[:2], dtype=bool),
+            #     image,
+            # )
+
+    # TODO: Morphological Closing
+    if config["closing_radius"] > 0:
+        foreground_pred_large = Call(
+            lambda foreground_pred_large: skimage.morphology.binary_closing(
+                foreground_pred_large.astype(bool)
+            ),
+            foreground_pred_large,
+        )
+
+    labels_large = Call(
+        lambda foreground_pred_large: skimage.measure.label(
+            foreground_pred_large.astype(bool)
+        ),
+        foreground_pred_large,
+    )
+
+    if config["full_frame_archive_fn"] is not None:
+        Call(assert_compatible_shape, labels_large, image)
+        segment_image = Call(
+            lambda labels, image: skimage.util.img_as_ubyte(
+                skimage.color.label2rgb(labels, image, bg_label=0, bg_color=None)
+            ),
+            labels_large,
+            image,
+        )
+
+        score_image = Call(
+            skimage.util.img_as_ubyte,
+            foreground_pred_large,
+        )
+
+        full_frame_archive_fn = Call(
+            str.format_map, config["full_frame_archive_fn"], meta
+        )
+
+        #  Store stitched result
+        EcotaxaWriter(
+            full_frame_archive_fn,
+            [
+                # Input image
+                ("img/" + meta["object_frame_id"] + ".png", image),
+                # Image overlayed with labeled segments
+                ("overlay/" + meta["object_frame_id"] + ".png", segment_image),
+                ("score/" + meta["object_frame_id"] + ".png", score_image),
+                # # Mask (255=foreground)
+                # (
+                #     "mask/" + meta["object_frame_id"] + ".png",
+                #     Call(lambda labels: (labels > 0).astype("uint8")*255, labels_large),
+                # ),
+            ],
+        )
+
+    StreamBuffer(2)
+
+    # Extract individual objects
+    region = FindRegions(labels_large, image, padding=75)
+
+    image = ExtractROI(image, region)
+
+    def recalc_metadata(region: RegionProperties, meta):
+        meta = meta.copy()
+
+        (y0, x0, x1, y1) = region.bbox
+
+        meta["object_posx"] = x0
+        meta["object_posy"] = y0
+        meta["object_sequence"] = region.label
+        meta["object_width"] = x1 - x0
+        meta["object_height"] = y1 - y0
+
+        meta["object_id"] = objid_pattern.format_map(meta)
+
+        return meta
+
+    # Re-calculate metadata (object_id, posx, posy)
+    meta = Call(recalc_metadata, region, meta)
+
+    # Re-calculate features
+    meta = CalculateZooProcessFeatures(region, meta, prefix="object_")
+    return image, meta
+
+
 def build_segmentation(segmentation_config, image, meta) -> Tuple[Variable, Variable]:
     if segmentation_config is None:
-        meta = Call(
-            lambda image, meta: {
-                **meta,
-                "object_height": image.shape[0],
-                "object_width": image.shape[1],
-            },
-            image,
-            meta,
-        )
         return image, meta
 
     if "threshold" in segmentation_config:
@@ -247,6 +505,14 @@ def build_segmentation(segmentation_config, image, meta) -> Tuple[Variable, Vari
         props = ImageProperties(mask, image)
         meta = CalculateZooProcessFeatures(props, meta, prefix="object_")
         return image, meta
+
+    if "stored" in segmentation_config:
+        return build_stored_segmentation(segmentation_config["stored"], image, meta)
+
+    if "pytorch" in segmentation_config:
+        return build_pytorch_segmentation(segmentation_config["pytorch"], image, meta)
+
+    raise ValueError(f"Unknown segmentation config: {segmentation_config}")
 
 
 def detector_extractor(img):
@@ -267,6 +533,7 @@ def detector_extractor(img):
 
 
 def calc_overlap(xy0, wh0, xy1, wh1):
+    """overlap_xy OR (keypoint_score AND overlap_y)"""
 
     l0 = xy0[0]
     r0 = xy0[0] + wh0[0]
@@ -298,9 +565,7 @@ def calc_overlap(xy0, wh0, xy1, wh1):
     return overlap_x, overlap_y, overlap_xy
 
 
-def score_fn(score, meta0, meta1):
-    """overlap_xy OR (keypoint_score AND overlap_y)"""
-
+def score_fn_simple(meta0, meta1):
     xy0 = meta0["object_posx"], meta0["object_posy"]
     xy1 = meta1["object_posx"], meta1["object_posy"]
     wh0 = meta0["object_width"], meta0["object_height"]
@@ -308,7 +573,75 @@ def score_fn(score, meta0, meta1):
 
     overlap_x, overlap_y, overlap_xy = calc_overlap(xy0, wh0, xy1, wh1)
 
-    return max(overlap_xy, min(score, overlap_y))
+    return overlap_xy
+
+
+@ReturnOutputs
+@Output("stitched")
+class Stitch(Node):
+    def __init__(self, *input, groupby, x, y, skip_single=False) -> None:
+        super().__init__()
+
+        self.input = input
+        self.groupby = groupby
+        self.x = x
+        self.y = y
+        self.skip_single = skip_single
+
+    def transform_stream(self, stream: Stream) -> Stream:
+        with closing_if_closable(stream):
+            stream_estimator = StreamEstimator()
+
+            for _, group in stream_groupby(stream, self.groupby):
+                group = list(group)
+
+                if self.skip_single and len(group) < 2:
+                    continue
+
+                with stream_estimator.consume(
+                    group[0].n_remaining_hint, est_n_emit=1, n_consumed=len(group)
+                ) as incoming_group:
+
+                    data = pd.DataFrame(
+                        [self.prepare_input(obj, ("input", "x", "y")) for obj in group],
+                        columns=["input", "x", "y"],
+                    )
+
+                    data[["h", "w"]] = data["input"].apply(
+                        lambda input: pd.Series(input[0].shape[:2])
+                    )
+
+                    data["xmax"] = data["x"] + data["w"]
+                    data["ymax"] = data["y"] + data["h"]
+
+                    first_input = data["input"].iloc[0]
+
+                    target_shape = (data["ymax"].max(), data["xmax"].max())
+
+                    # Create accumulator arrays
+                    # Use float to avoid overflows
+                    stitched = [
+                        np.zeros(target_shape + inp.shape[2:], dtype=float)
+                        for inp in first_input
+                    ]
+
+                    for row in data.itertuples():
+                        for i, inp in enumerate(row.input):
+                            sl = (
+                                slice(row.y, row.y + row.h),
+                                slice(row.x, row.x + row.w),
+                            )
+                            np.maximum(stitched[i][sl], inp, out=stitched[i][sl])
+
+                    stitched = [
+                        st.astype(inp.dtype) for st, inp in zip(stitched, first_input)
+                    ]
+
+                    yield self.prepare_output(
+                        group[0].copy(),
+                        stitched,
+                        n_remaining_hint=incoming_group.emit(),
+                    )
 
 
 def build_pipeline(input, output):
@@ -352,12 +685,10 @@ def build_pipeline(input, output):
             meta,
         )
 
-        duplicate_dir = Call(
+        input_meta_archive_fn = Call(
             lambda meta: os.path.join(
                 output["path"],
-                f"{datetime.datetime.now():%y-%m-%d}-"
-                + "LOKI_{sample_station}_{sample_haul}".format_map(meta),
-                "duplicates",
+                "LOKI_{sample_station}_{sample_haul}_input_meta.zip".format_map(meta),
             ),
             meta,
         )
@@ -369,6 +700,8 @@ def build_pipeline(input, output):
         # img_fn = Find(pictures_path, [".bmp"])
         img_fn = Glob(pictures_pat, sorted=True)
 
+        Progress()
+
         # Extract object ID
         object_id = Call(
             lambda img_fn: os.path.splitext(os.path.basename(img_fn))[0], img_fn
@@ -377,65 +710,64 @@ def build_pipeline(input, output):
         # Parse object ID and update metadata
         meta = Call(parse_object_id, object_id, meta)
 
-        # # Merge telemetry
-        # meta = Call(merge_telemetry, meta, telemetry)
+        def error_handler(exc, img_fn):
+            traceback.print_exc(file=sys.stderr)
+            print("img_fn:", img_fn, file=sys.stderr)
 
-        # Read image
-        image = ImageReader(img_fn)
+        # Skip object if image can not be loaded
+        with MergeNodesPipeline(on_error=error_handler, on_error_args=(img_fn,)):
+            # Read image
+            image = ImageReader(img_fn, "L")
 
-        image, meta = build_segmentation(input.get("segmentation"), image, meta)
-
-        # Filter(meta["object_mc_area"] > 500)
-
-        frame_id = Call(
-            lambda meta: "{object_date} {object_time}  {object_milliseconds}".format_map(
-                meta
-            ),
+        meta = Call(
+            lambda image, meta: {
+                **meta,
+                "object_height": image.shape[0],
+                "object_width": image.shape[1],
+            },
+            image,
             meta,
         )
 
+        # Write input metadata
+        EcotaxaWriter(input_meta_archive_fn, [], meta)
+
+        # # Merge telemetry
+        # meta = Call(merge_telemetry, meta, telemetry)
+
+        # # Detect duplicates
+        # dupset_id = DetectDuplicatesSimple(
+        #     meta["object_frame_id"],
+        #     meta["object_id"],
+        #     score_fn=score_fn_simple,
+        #     score_arg=meta,
+        #     min_similarity=0.98,
+        #     max_age=1,
+        #     verbose=False,
+        # )
+
+        # # Only keep unique objects
+        # Filter(dupset_id == meta["object_id"])
+
+        image, meta = build_segmentation(input.get("segmentation"), image, meta)
+
+        slice_ = input.get("slice", None)
+        if slice_ is not None:
+            print(f"Only processing the first {slice_} objects.")
+            Slice(slice_)
+
+        # Filter(meta["object_mc_area"] > 500)
+
         StreamBuffer(8)
 
-        # Detect Duplicates (ZOOMIE2)
-
-        dupset_id = DetectDuplicates(
-            object_id,
-            image,
-            frame_id,
-            score_fn=score_fn,
-            score_arg=meta,
-            detector_extractor=detector_extractor,
-            verbose=True,
-            min_similarity=0.5,
-            n_workers=8,
-            # n_workers=1,
-            pre_score_thr=0.75,
-            max_age=24,
+        target_image_fn = Call(
+            output.get("image_fn", "{object_id}.jpg").format_map, meta
         )
-
-        StoreDupsets(
-            object_id, dupset_id, image, frame_id, duplicate_dir, save_singletons=True
-        )
-
-        # # if segmentation == "threshold":
-        # #     # Simple segmentation
-        # #     mask = ...
-        # #     props = ImageProperties(mask, image)
-        # #     meta = CalculateZooProcessFeatures(props, prefix="object_mc_")
-        # # else:
-        # #     # Assemble and resegment
-        # #     image, meta = Resegment()
-
-        # target_image_fn = Call(
-        #     output.get("image_fn", "{object_id}.jpg").format_map, meta
-        # )
 
         # # # Image enhancement: Stretch contrast
         # # image = Call(stretch_contrast, image, 0.01, 0.99)
 
-        # EcotaxaWriter(target_archive_fn, (target_image_fn, image), meta)
-
-        Progress()
+        EcotaxaWriter(target_archive_fn, (target_image_fn, image), meta)
 
     p.run()
 
@@ -445,6 +777,15 @@ if __name__ == "__main__":
 
     from schema import PipelineSchema
 
-    with open(sys.argv[1]) as f:
+    if len(sys.argv) != 2:
+        print("You need to supply a task file", file=sys.stderr)
+
+    task_fn = sys.argv[1]
+
+    sys.path.insert(0, os.path.realpath(os.curdir))
+
+    os.chdir(os.path.dirname(task_fn))
+
+    with open(task_fn) as f:
         config = PipelineSchema().load(yaml.safe_load(f))
         p = build_pipeline(**config)
