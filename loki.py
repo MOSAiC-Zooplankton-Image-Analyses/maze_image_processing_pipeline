@@ -92,7 +92,12 @@ LOG_FIELDS = {
 
 
 def _parse_tmd_line(line: str, fields) -> Tuple[str, Any]:
-    idx, value = line.rstrip("\n").split(";", 1)
+    try:
+        idx, value = line.rstrip("\n").split(";", 1)
+    except:
+        print("Offending line:", line)
+        raise
+
     name, converter = fields[int(idx)]
     if converter is not None:
         try:
@@ -112,7 +117,7 @@ def _parse_dat_line(idx: int, line: str, fields) -> Tuple[str, Any]:
         try:
             value = converter(value)
         except Exception as exc:
-            raise type(exc)(*exc.args, f"Field {name}")
+            raise type(exc)(*exc.args, f"Field {name}") from exc
 
     return name, value
 
@@ -124,7 +129,9 @@ def read_tmd(fn):
 
 def read_dat(fn):
     with open(fn, "r") as f:
-        contents = f.read()
+        # FIXME: Sometimes, a .dat contains multiple lines.
+        # Here, we only use the first one.
+        contents = f.readline()
 
     fields = contents.split("\t")
 

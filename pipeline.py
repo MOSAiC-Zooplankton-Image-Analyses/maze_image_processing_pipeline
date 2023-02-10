@@ -1,13 +1,12 @@
+import contextlib
 import datetime
 import glob
 import gzip
 import os
 import pickle
-import queue
-import threading
 import traceback
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Dict, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,10 +26,7 @@ from morphocut.core import (
     Output,
     ReturnOutputs,
     Stream,
-    StreamObject,
-    StreamTransformer,
     Variable,
-    check_stream,
     closing_if_closable,
 )
 from morphocut.file import Glob
@@ -41,10 +37,12 @@ from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 from morphocut.utils import StreamEstimator, stream_groupby
 from skimage.feature.orb import ORB
+import skimage.measure
 from skimage.measure._regionprops import RegionProperties
 
 import loki
 import segmenter
+from maze_dl.merge_labels import merge_labels
 
 
 def find_data_roots(project_root):
@@ -127,42 +125,56 @@ def parse_telemetry_fn(tmd_fn):
     return datetime.datetime(*r)
 
 
-def _read_tmd(tmd_fn):
+def _read_tmd(tmd_fn, ignore_errors=False):
+    dt = parse_telemetry_fn(tmd_fn)
+
     try:
         tmd = loki.read_tmd(tmd_fn)
     except:
         print(f"Error reading {tmd_fn}")
-        raise
+        if not ignore_errors:
+            raise
+        return dt, {}
 
-    dt = parse_telemetry_fn(tmd_fn)
-
-    return dt, {ke: tmd[kl] for ke, kl in TMD2META.items()}
+    return dt, {k_et: tmd[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in tmd}
 
 
-def _read_dat(dat_fn):
-    try:
-        dat = loki.read_dat(dat_fn)
-    except:
-        print(f"Error reading {dat_fn}")
-        raise
-
+def _read_dat(dat_fn, ignore_errors=False):
     dt = parse_telemetry_fn(dat_fn)
 
-    return dt, {ke: dat[kl] for ke, kl in TMD2META.items()}
+    try:
+        dat = loki.read_dat(dat_fn)
+    except Exception as exc:
+        print(f"Error reading {dat_fn}")
+        if ignore_errors:
+            print(exc)
+        else:
+            raise
+        return dt, {}
+
+    return dt, {k_et: dat[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in dat}
 
 
-def read_all_telemetry(data_root: str):
+def read_all_telemetry(data_root: str, ignore_errors=False):
     print("Reading telemetry...")
 
     tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
     telemetry = pd.DataFrame.from_dict(
-        dict(_read_tmd(tmd_fm) for tmd_fm in glob.iglob(tmd_pat)), orient="index"
+        dict(
+            _read_tmd(tmd_fm, ignore_errors=ignore_errors)
+            for tmd_fm in glob.iglob(tmd_pat)
+        ),
+        orient="index",
     )
 
     # Also read .dat files
     dat_pat = os.path.join(data_root, "Telemetrie", "*.dat")
     dat = pd.DataFrame.from_dict(
-        dict(_read_dat(dat_fm) for dat_fm in glob.iglob(dat_pat)), orient="index"
+        dict(
+            _read_dat(dat_fm, ignore_errors=ignore_errors)
+            for dat_fm in glob.iglob(dat_pat)
+        ),
+        orient="index",
     )
     dat = dat[~dat.index.isin(telemetry.index)]
     if not dat.empty:
@@ -357,12 +369,93 @@ def assert_compatible_shape(label, image):
         raise
 
 
+def convert_img_dtype(image, dtype: np.dtype):
+    image = np.asarray(image)
+
+    if dtype.kind == "f":
+        if image.dtype.kind == "u":
+            factor = np.array(1.0 / np.iinfo(image.dtype).max, dtype=dtype)
+            return np.multiply(image, factor)
+
+        if image.dtype.kind == "f":
+            return np.asarray(image, dtype)
+
+    raise ValueError(f"Can not convert {image.dtype} to {dtype}.")
+
+
+def build_segmentation_postprocessing(config: Mapping, foreground_pred):
+    with contextlib.ExitStack() as exit_stack:
+        if config["n_threads"] > 1:
+            # Post-processing task is CPU-bound
+            exit_stack.enter_context(DataParallelPipeline(executor=config["n_threads"]))
+
+        # Convert to bool
+        foreground_pred = Call(np.asarray, foreground_pred, dtype=bool)
+
+        # Opening (remove small details)
+        if config["opening_radius"] > 0:
+            foreground_pred = Call(
+                skimage.morphology.binary_opening,
+                foreground_pred,
+                skimage.morphology.disk(config["opening_radius"]),
+            )
+
+        # Closing (close small gaps)
+        if config["closing_radius"] > 0:
+            foreground_pred = Call(
+                skimage.morphology.binary_closing,
+                foreground_pred,
+                skimage.morphology.disk(config["closing_radius"]),
+            )
+
+        # Label the image
+        labels = Call(
+            skimage.measure.label,
+            foreground_pred,
+        )
+
+        # Remove objects below area threshold
+        if config["min_area"] > 0:
+            labels = Call(
+                skimage.morphology.remove_small_objects,
+                labels,
+                min_size=config["min_area"],
+                out=labels,
+            )
+
+        # Merge neighboring labels
+        if config["merge_labels"] > 0:
+            labels = Call(
+                merge_labels,
+                labels,
+                max_distance=config["merge_labels"],
+                labels_out=labels,
+            )
+
+    return foreground_pred, labels
+
+
 def build_pytorch_segmentation(config: Mapping, image, meta):
     import torch
     import torch.jit
-    import torchvision.transforms.functional as tvtf
+    import torchvision.transforms.functional as ttf
 
+    if config["stitch"]:
+        # Buffer to have enough ROIs immediately available for stitching
+        StreamBuffer(16)
+
+        # Stitch individual ROIs together to build a full-frame image
+        image = Stitch(
+            image,
+            groupby=meta["object_frame_id"],
+            x=meta["object_posx"],
+            y=meta["object_posy"],
+            skip_single=config["skip_single"],
+        ).unpack(1)
+
+    # Deep Learning Segmentation
     device = config["device"]
+    dtype = config["dtype"]
 
     if config.get("model_fn"):
         model = torch.load(config.get("model_fn"), map_location=device)
@@ -371,20 +464,23 @@ def build_pytorch_segmentation(config: Mapping, image, meta):
     else:
         raise ValueError("No model fn")
 
-    StreamBuffer(16)
+    assert isinstance(model, torch.nn.Module), "Model is not a torch.nn.Module"
 
-    image = Stitch(
-        image,
-        groupby=meta["object_frame_id"],
-        x=meta["object_posx"],
-        y=meta["object_posy"],
-        skip_single=config["skip_single"],
-    ).unpack(1)
+    # Convert model to the specified dtype
+    torch_dtype = getattr(torch, dtype)
+    np_dtype = np.dtype(dtype)
+    model = model.to(torch_dtype)
 
-    def prepare(img):
+    def pre_transform(img):
+        """Ensure RGB image, convert to specified dtype and transpose."""
         if img.ndim == 2:
             img = skimage.color.gray2rgb(img)
-        return tvtf.to_tensor(img)
+
+        img = img.transpose((2, 0, 1))
+
+        img = convert_img_dtype(img, np_dtype)
+
+        return torch.from_numpy(img).contiguous()
 
     with TiledPipeline((1024, 1024), image, tile_stride=(896, 896)):
         # # Skip empty tiles
@@ -393,52 +489,50 @@ def build_pytorch_segmentation(config: Mapping, image, meta):
         # Filter(lambda image: (image > 0).any(), image)
         Filter(Call(lambda image: (image > 0).any(), image))
 
-        # Each model execution starts processes. Reduce overhead by increasing batch size?
-        with DataParallelPipeline(executor=16):
-            foreground_pred_large = PyTorch(
+        with contextlib.ExitStack() as exit_stack:
+            if config["batch_size"]:
+                exit_stack.enter_context(BatchedPipeline(config["batch_size"]))
+
+            if config["n_threads"] > 1:
+                exit_stack.enter_context(
+                    DataParallelPipeline(executor=config["n_threads"])
+                )
+
+            foreground_pred = PyTorch(
                 model,
                 image,
                 device=device,
                 output_key=0,
-                prepare=prepare,
+                pre_transform=pre_transform,
                 pin_memory=True,
+                autocast=config["autocast"],
             )
 
             # # Dummy for speed optimization
-            # foreground_pred_large = Call(
+            # foreground_pred = Call(
             #     lambda image: np.zeros(image.shape[:2], dtype=bool),
             #     image,
             # )
 
-    # TODO: Morphological Closing
-    if config["closing_radius"] > 0:
-        foreground_pred_large = Call(
-            lambda foreground_pred_large: skimage.morphology.binary_closing(
-                foreground_pred_large.astype(bool)
-            ),
-            foreground_pred_large,
-        )
-
-    labels_large = Call(
-        lambda foreground_pred_large: skimage.measure.label(
-            foreground_pred_large.astype(bool)
-        ),
-        foreground_pred_large,
+    # Postprocessing
+    foreground_pred, labels = build_segmentation_postprocessing(
+        config["postprocess"], foreground_pred
     )
 
+    # DEBUG: Store segmentation output
     if config["full_frame_archive_fn"] is not None:
-        Call(assert_compatible_shape, labels_large, image)
+        Call(assert_compatible_shape, labels, image)
         segment_image = Call(
             lambda labels, image: skimage.util.img_as_ubyte(
                 skimage.color.label2rgb(labels, image, bg_label=0, bg_color=None)
             ),
-            labels_large,
+            labels,
             image,
         )
 
         score_image = Call(
             skimage.util.img_as_ubyte,
-            foreground_pred_large,
+            foreground_pred,
         )
 
         full_frame_archive_fn = Call(
@@ -454,18 +548,13 @@ def build_pytorch_segmentation(config: Mapping, image, meta):
                 # Image overlayed with labeled segments
                 ("overlay/" + meta["object_frame_id"] + ".png", segment_image),
                 ("score/" + meta["object_frame_id"] + ".png", score_image),
-                # # Mask (255=foreground)
-                # (
-                #     "mask/" + meta["object_frame_id"] + ".png",
-                #     Call(lambda labels: (labels > 0).astype("uint8")*255, labels_large),
-                # ),
             ],
         )
 
-    StreamBuffer(2)
+        StreamBuffer(2)
 
     # Extract individual objects
-    region = FindRegions(labels_large, image, padding=75)
+    region = FindRegions(labels, image, padding=75)
 
     image = ExtractROI(image, region)
 
@@ -644,7 +733,7 @@ class Stitch(Node):
                     )
 
 
-def build_pipeline(input, output):
+def build_pipeline(input, segmentation, output):
     """
     Args:
         input_path (str): Path to LOKI data (directory containing "Pictures" and "Telemetrie").
@@ -671,8 +760,8 @@ def build_pipeline(input, output):
         # Load LOG metadata
         meta = Call(read_log, data_root, meta)
 
-        # # Load *all* telemetry data
-        # telemetry = Call(read_all_telemetry, data_root)
+        # Load *all* telemetry data
+        telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
 
         # Load additional metadata
         meta = Call(update_and_validate_sample_meta, data_root, meta)
@@ -700,6 +789,11 @@ def build_pipeline(input, output):
         # img_fn = Find(pictures_path, [".bmp"])
         img_fn = Glob(pictures_pat, sorted=True)
 
+        slice_ = input.get("slice", None)
+        if slice_ is not None:
+            print(f"Only processing the first {slice_} objects.")
+            Slice(slice_)
+
         Progress()
 
         # Extract object ID
@@ -709,6 +803,8 @@ def build_pipeline(input, output):
 
         # Parse object ID and update metadata
         meta = Call(parse_object_id, object_id, meta)
+
+        # TODO: Skip frames where no annotated objects exist
 
         def error_handler(exc, img_fn):
             traceback.print_exc(file=sys.stderr)
@@ -732,8 +828,10 @@ def build_pipeline(input, output):
         # Write input metadata
         EcotaxaWriter(input_meta_archive_fn, [], meta)
 
-        # # Merge telemetry
-        # meta = Call(merge_telemetry, meta, telemetry)
+        # Merge telemetry
+        meta = Call(merge_telemetry, meta, telemetry)
+
+        image, meta = build_segmentation(segmentation, image, meta)
 
         # # Detect duplicates
         # dupset_id = DetectDuplicatesSimple(
@@ -748,13 +846,6 @@ def build_pipeline(input, output):
 
         # # Only keep unique objects
         # Filter(dupset_id == meta["object_id"])
-
-        image, meta = build_segmentation(input.get("segmentation"), image, meta)
-
-        slice_ = input.get("slice", None)
-        if slice_ is not None:
-            print(f"Only processing the first {slice_} objects.")
-            Slice(slice_)
 
         # Filter(meta["object_mc_area"] > 500)
 

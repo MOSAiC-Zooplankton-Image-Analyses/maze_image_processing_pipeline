@@ -1,5 +1,5 @@
-from typing import Callable, Mapping
-from marshmallow import Schema, fields, pre_load, post_load, post_dump
+from typing import Mapping
+from marshmallow import Schema, fields, pre_load
 
 
 class DefaultSchema(Schema):
@@ -10,6 +10,14 @@ class DefaultSchema(Schema):
         if isinstance(value, Mapping):
             return value
         return {self.__default_field__: value}
+
+
+class SegmentationPostprocessing(Schema):
+    closing_radius = fields.Int(load_default=0)
+    opening_radius = fields.Int(load_default=0)
+    merge_labels = fields.Int(load_default=0)
+    min_area = fields.Int(load_default=0)
+    n_threads = fields.Int(load_default=0)
 
 
 class ThresholdSegmentation(DefaultSchema):
@@ -31,7 +39,12 @@ class PytorchSegmentation(DefaultSchema):
     full_frame_archive_fn = fields.Str(load_default=None)
     skip_single = fields.Bool(load_default=False)
     device = fields.Str(load_default="cpu")
-    closing_radius = fields.Int(load_default=0)
+    stitch = fields.Bool(load_default=True)
+    postprocess = fields.Nested(SegmentationPostprocessing, required=False)
+    n_threads = fields.Int(load_default=0)
+    batch_size = fields.Int(load_default=0)
+    autocast = fields.Bool(load_default=False)
+    dtype = fields.Str(load_default="float32")
 
 
 class SegmentationSchema(Schema):
@@ -42,7 +55,7 @@ class SegmentationSchema(Schema):
 
 class LokiInputSchema(Schema):
     path = fields.Str()
-    segmentation = fields.Nested(SegmentationSchema)
+    # Process only this many objects
     slice = fields.Int(required=False)
     meta = fields.Dict(required=False)
 
@@ -62,6 +75,7 @@ class OutputSchema(Schema):
 
 class PipelineSchema(Schema):
     input = fields.Nested(LokiInputSchema, required=True)
+    segmentation = fields.Nested(SegmentationSchema)
     output = fields.Nested(EcoTaxaOutputSchema, required=True)
 
 
@@ -70,7 +84,7 @@ if __name__ == "__main__":
     import yaml
 
     with open(sys.argv[1]) as f:
-        config = PipelineConfig()
+        config = PipelineSchema()
         x = config.load(yaml.safe_load(f))
 
         print(x)
