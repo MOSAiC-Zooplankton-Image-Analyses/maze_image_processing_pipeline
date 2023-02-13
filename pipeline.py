@@ -1,12 +1,13 @@
 import contextlib
 import datetime
+import fnmatch
 import glob
 import gzip
 import os
 import pickle
 import traceback
 from pathlib import Path
-from typing import Dict, Mapping, Tuple
+from typing import Collection, Dict, List, Mapping, Sequence, Tuple
 
 import morphocut
 import numpy as np
@@ -34,7 +35,11 @@ from morphocut.core import (
 )
 from morphocut.file import Glob
 from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
-from morphocut.pipelines import DataParallelPipeline, MergeNodesPipeline
+from morphocut.pipelines import (
+    AggregateErrorsPipeline,
+    DataParallelPipeline,
+    MergeNodesPipeline,
+)
 from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
@@ -45,15 +50,31 @@ from skimage.measure._regionprops import RegionProperties
 import _version
 import loki
 import segmenter
+from tqdm import tqdm
+
+import logging
+
+logging.captureWarnings(True)
+logger = logging.getLogger(__name__)
 
 
-def find_data_roots(project_root):
-    print("Detecting project folders...")
-    for root, dirs, _ in os.walk(project_root):
-        if "Pictures" in dirs and "Telemetrie" in dirs:
-            yield root
-            # Do not descend further
-            dirs[:] = []
+def find_data_roots(project_root, ignore_patterns: Collection | None = None):
+    logger.info("Detecting project folders...")
+    with tqdm(leave=False) as progress_bar:
+        for root, dirs, _ in os.walk(project_root):
+            progress_bar.set_description(root, refresh=False)
+            progress_bar.update(1)
+
+            if ignore_patterns is not None:
+                if any(fnmatch.fnmatch(root, pat) for pat in ignore_patterns):
+                    # Do not descend further
+                    dirs[:] = []
+                    continue
+
+            if "Pictures" in dirs and "Telemetrie" in dirs:
+                yield root
+                # Do not descend further
+                dirs[:] = []
 
 
 LOG2META = {
@@ -133,7 +154,7 @@ def _read_tmd(tmd_fn, ignore_errors=False):
     try:
         tmd = loki.read_tmd(tmd_fn)
     except:
-        print(f"Error reading {tmd_fn}")
+        logger.error(f"Error reading {tmd_fn}", exc_info=True)
         if not ignore_errors:
             raise
         return dt, {}
@@ -147,10 +168,8 @@ def _read_dat(dat_fn, ignore_errors=False):
     try:
         dat = loki.read_dat(dat_fn)
     except Exception as exc:
-        print(f"Error reading {dat_fn}")
-        if ignore_errors:
-            print(exc)
-        else:
+        logger.error(f"Error reading {dat_fn}", exc_info=True)
+        if not ignore_errors:
             raise
         return dt, {}
 
@@ -158,13 +177,16 @@ def _read_dat(dat_fn, ignore_errors=False):
 
 
 def read_all_telemetry(data_root: str, ignore_errors=False):
-    print("Reading telemetry...")
+    logger.info("Reading telemetry...")
 
     tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
+    tmd_fns = glob.glob(tmd_pat)
+    tmd_names = set(os.path.splitext(tmd_fn)[0] for tmd_fn in tmd_fns)
+
     telemetry = pd.DataFrame.from_dict(
         dict(
-            _read_tmd(tmd_fm, ignore_errors=ignore_errors)
-            for tmd_fm in glob.iglob(tmd_pat)
+            _read_tmd(tmd_fn, ignore_errors=ignore_errors)
+            for tmd_fn in tqdm(tmd_fns, desc=f"{data_root}/*.tmd")
         ),
         orient="index",
     )
@@ -173,8 +195,9 @@ def read_all_telemetry(data_root: str, ignore_errors=False):
     dat_pat = os.path.join(data_root, "Telemetrie", "*.dat")
     dat = pd.DataFrame.from_dict(
         dict(
-            _read_dat(dat_fm, ignore_errors=ignore_errors)
-            for dat_fm in glob.iglob(dat_pat)
+            _read_dat(dat_fn, ignore_errors=ignore_errors)
+            for dat_fn in tqdm(glob.glob(dat_pat), desc=f"{data_root}/*.dat")
+            if os.path.splitext(dat_fn)[0] not in tmd_names
         ),
         orient="index",
     )
@@ -225,13 +248,16 @@ def update_and_validate_sample_meta(data_root: str, meta: Dict):
     # Update with additional metadata
     if os.path.isfile(meta_fn):
         with open(meta_fn) as f:
-            meta.update(yaml.unsafe_load(f))
+            value = yaml.unsafe_load(f)
+
+            if not isinstance(value, Mapping):
+                raise ValueError(f"Unexpected content in {meta_fn}: {value}")
+
+            meta.update(value)
 
     missing_keys = set(REQUIRED_SAMPLE_META) - set(meta.keys())
     if missing_keys:
         missing_keys_str = ", ".join(sorted(missing_keys))
-
-        Path(meta_fn).touch()
 
         raise MissingMetaError(
             f"The following fields are missing: {missing_keys_str}.\nSupply them in {meta_fn}"
@@ -373,7 +399,7 @@ def assert_compatible_shape(label, image):
             image.shape[: label.ndim] == label.shape
         ), f"{label.shape} vs. {image.shape}"
     except:
-        print(f"{label.shape} vs. {image.shape}")
+        logger.error(f"{label.shape} vs. {image.shape}", exc_info=True)
         raise
 
 
@@ -762,7 +788,7 @@ def build_object_frame_id_filter(
     if filter_object_frame_id_fn is None:
         return
 
-    print(f"Filtering object_frame_id from {filter_object_frame_id_fn}...")
+    logger.info(f"Filtering object_frame_id from {filter_object_frame_id_fn}...")
 
     index = pd.Index(
         pd.read_csv(filter_object_frame_id_fn, header=None, index_col=False).squeeze()
@@ -786,9 +812,11 @@ def build_pipeline(input, segmentation, output):
     meta.setdefault("acq_instrument", "LOKI")
 
     # List directories that contain "Pictures" and "Telemetrie" folders
-    data_roots = list(find_data_roots(input["path"]))
+    data_roots = list(
+        find_data_roots(input["path"], input.get("ignore_patterns", None))
+    )
 
-    print(f"Found {len(data_roots):d} input directories below {input['path']}")
+    logger.info(f"Found {len(data_roots):d} input directories below {input['path']}")
 
     with Pipeline() as p:
         data_root = Unpack(data_roots)
@@ -798,11 +826,13 @@ def build_pipeline(input, segmentation, output):
         # Load LOG metadata
         meta = Call(read_log, data_root, meta)
 
+        # Preload all metadata (to avoid later errores due to missing fields)
+        with AggregateErrorsPipeline():
+            # Load additional metadata
+            meta = Call(update_and_validate_sample_meta, data_root, meta)
+
         # Load *all* telemetry data
         telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
-
-        # Load additional metadata
-        meta = Call(update_and_validate_sample_meta, data_root, meta)
 
         target_archive_fn = Call(
             lambda meta: os.path.join(
@@ -819,6 +849,9 @@ def build_pipeline(input, segmentation, output):
             ),
             meta,
         )
+
+        # Buffer per-data_root processing (telemetry, metadata)
+        StreamBuffer(1)
 
         Call(print, meta, "\n")
 
@@ -841,14 +874,14 @@ def build_pipeline(input, segmentation, output):
         # DEBUG: Slice
         slice_ = input.get("slice", None)
         if slice_ is not None:
-            print(f"Only processing the first {slice_} objects.")
+            logger.info(f"Only processing the first {slice_} objects.")
             Slice(slice_)
 
         Progress()
 
         def error_handler(exc, img_fn):
             traceback.print_exc(file=sys.stderr)
-            print("img_fn:", img_fn, file=sys.stderr)
+            logger.error(f"Could not read image: {img_fn}", exc_info=True)
 
         # Skip object if image can not be loaded
         with MergeNodesPipeline(on_error=error_handler, on_error_args=(img_fn,)):
@@ -916,6 +949,26 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.realpath(os.curdir))
 
     os.chdir(os.path.dirname(task_fn))
+
+    # Setup logging
+    log_fn = os.path.abspath(
+        f'loki_pipeline-{datetime.datetime.now().isoformat(timespec="seconds")}.log'
+    )
+    print(f"Logging to {log_fn}.")
+    file_handler = logging.FileHandler(log_fn)
+    file_handler.setLevel(logging.INFO)
+    stream_handler = logging.StreamHandler()
+    file_handler.setLevel(logging.INFO)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
+
+    # Also capture py.warnings
+    warnings_logger = logging.getLogger("py.warnings")
+    warnings_logger.addHandler(file_handler)
+    warnings_logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
 
     with open(task_fn) as f:
         config = PipelineSchema().load(yaml.safe_load(f))

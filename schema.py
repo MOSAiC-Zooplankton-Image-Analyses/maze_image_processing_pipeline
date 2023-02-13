@@ -59,6 +59,7 @@ class LokiInputSchema(Schema):
     slice = fields.Int(required=False)
     meta = fields.Dict(required=False)
     filter_object_frame_id = fields.Str(load_default=None)
+    ignore_patterns = fields.List(fields.Str, required=False)
 
 
 class InputSchema(Schema):

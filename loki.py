@@ -103,7 +103,7 @@ def _parse_tmd_line(line: str, fields) -> Tuple[str, Any]:
         try:
             value = converter(value)
         except Exception as exc:
-            raise type(exc)(*exc.args, f"Field {name}")
+            raise type(exc)(*exc.args, f"Field {name}") from exc
 
     return name, value
 
