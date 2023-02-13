@@ -58,6 +58,7 @@ class LokiInputSchema(Schema):
     # Process only this many objects
     slice = fields.Int(required=False)
     meta = fields.Dict(required=False)
+    filter_object_frame_id = fields.Str(load_default=None)
 
 
 class InputSchema(Schema):

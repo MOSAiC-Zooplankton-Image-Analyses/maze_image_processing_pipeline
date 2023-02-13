@@ -8,14 +8,17 @@ import traceback
 from pathlib import Path
 from typing import Dict, Mapping, Tuple
 
+import morphocut
 import numpy as np
 import pandas as pd
 import parse
 import skimage.color
 import skimage.exposure
 import skimage.filters
+import skimage.measure
 import skimage.morphology
 import yaml
+from maze_dl.merge_labels import merge_labels
 from morphocut import Pipeline
 from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -37,12 +40,11 @@ from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 from morphocut.utils import StreamEstimator, stream_groupby
 from skimage.feature.orb import ORB
-import skimage.measure
 from skimage.measure._regionprops import RegionProperties
 
+import _version
 import loki
 import segmenter
-from maze_dl.merge_labels import merge_labels
 
 
 def find_data_roots(project_root):
@@ -237,6 +239,12 @@ def update_and_validate_sample_meta(data_root: str, meta: Dict):
 
     meta["sample_id"] = "{sample_station}_{sample_haul}".format_map(meta)
     meta["acq_id"] = "{acq_instrument}_{sample_id}".format_map(meta)
+
+    meta["process_datetime"] = datetime.datetime.now().isoformat(timespec="seconds")
+    meta["process_id"] = "{acq_id}_{process_datetime}".format_map(meta)
+    meta["process_morphocut_version"] = morphocut.__version__
+    meta["process_loki_pipeline_version"] = _version.get_versions()["version"]
+    # TODO: More process metadata
 
     return meta
 
@@ -435,10 +443,21 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
     return foreground_pred, labels
 
 
-def build_pytorch_segmentation(config: Mapping, image, meta):
+def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], meta):
     import torch
     import torch.jit
-    import torchvision.transforms.functional as ttf
+
+    # # Construct image AnchoredArray (with slices meta-information)
+    # image = Call(
+    #     lambda image, x, y: AnchoredArray.create(image, offsets=(y, x)),
+    #     image,
+    #     meta["object_posx"],
+    #     meta["object_posy"],
+    # )
+    # if config["cluster_stitch"]:
+    #     # Buffer to have enough ROIs immediately available for stitching
+    #     StreamBuffer(16)
+    #     region = ClusterStitch(region, groupby=meta["object_frame_id"], margin=75)
 
     if config["stitch"]:
         # Buffer to have enough ROIs immediately available for stitching
@@ -578,6 +597,10 @@ def build_pytorch_segmentation(config: Mapping, image, meta):
 
     # Re-calculate features
     meta = CalculateZooProcessFeatures(region, meta, prefix="object_")
+
+    # # Restore regular ndarray image
+    # image = Call(lambda image: image.data, image)
+
     return image, meta
 
 
@@ -733,6 +756,21 @@ class Stitch(Node):
                     )
 
 
+def build_object_frame_id_filter(
+    filter_object_frame_id_fn: str | None, meta: Variable[Mapping]
+):
+    if filter_object_frame_id_fn is None:
+        return
+
+    print(f"Filtering object_frame_id from {filter_object_frame_id_fn}...")
+
+    index = pd.Index(
+        pd.read_csv(filter_object_frame_id_fn, header=None, index_col=False).squeeze()
+    )
+
+    Filter(lambda obj: obj[meta]["object_frame_id"] in index)
+
+
 def build_pipeline(input, segmentation, output):
     """
     Args:
@@ -789,13 +827,6 @@ def build_pipeline(input, segmentation, output):
         # img_fn = Find(pictures_path, [".bmp"])
         img_fn = Glob(pictures_pat, sorted=True)
 
-        slice_ = input.get("slice", None)
-        if slice_ is not None:
-            print(f"Only processing the first {slice_} objects.")
-            Slice(slice_)
-
-        Progress()
-
         # Extract object ID
         object_id = Call(
             lambda img_fn: os.path.splitext(os.path.basename(img_fn))[0], img_fn
@@ -805,6 +836,15 @@ def build_pipeline(input, segmentation, output):
         meta = Call(parse_object_id, object_id, meta)
 
         # TODO: Skip frames where no annotated objects exist
+        build_object_frame_id_filter(input["filter_object_frame_id"], meta)
+
+        # DEBUG: Slice
+        slice_ = input.get("slice", None)
+        if slice_ is not None:
+            print(f"Only processing the first {slice_} objects.")
+            Slice(slice_)
+
+        Progress()
 
         def error_handler(exc, img_fn):
             traceback.print_exc(file=sys.stderr)
