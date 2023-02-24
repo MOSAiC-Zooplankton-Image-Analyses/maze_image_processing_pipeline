@@ -45,6 +45,8 @@ class PytorchSegmentation(DefaultSchema):
     batch_size = fields.Int(load_default=0)
     autocast = fields.Bool(load_default=False)
     dtype = fields.Str(load_default="float32")
+    apply_mask = fields.Bool(load_default=False)
+    min_intensity = fields.Int(load_default=None)
 
 
 class SegmentationSchema(Schema):
@@ -60,6 +62,7 @@ class LokiInputSchema(Schema):
     meta = fields.Dict(required=False)
     filter_object_frame_id = fields.Str(load_default=None)
     ignore_patterns = fields.List(fields.Str, required=False)
+    merge_telemetry = fields.Bool(load_default=True)
 
 
 class InputSchema(Schema):

@@ -6,8 +6,7 @@ import gzip
 import os
 import pickle
 import traceback
-from pathlib import Path
-from typing import Collection, Dict, List, Mapping, Sequence, Tuple
+from typing import Collection, Dict, Mapping, Tuple
 
 import morphocut
 import numpy as np
@@ -26,12 +25,7 @@ from morphocut.contrib.ecotaxa import EcotaxaWriter
 from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
 from morphocut.core import (
     Call,
-    Node,
-    Output,
-    ReturnOutputs,
-    Stream,
     Variable,
-    closing_if_closable,
 )
 from morphocut.file import Glob
 from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
@@ -43,9 +37,9 @@ from morphocut.pipelines import (
 from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
-from morphocut.utils import StreamEstimator, stream_groupby
 from skimage.feature.orb import ORB
 from skimage.measure._regionprops import RegionProperties
+from morphocut.stitch import Stitch
 
 import _version
 import loki
@@ -317,16 +311,19 @@ def build_stored_segmentation(stored_config, image, meta):
 
     scores = Call(_predict_scores, image, segmenter_)
 
-    stitched = Stitch(
+    image_large, scores_large = Stitch(
         image,
         scores,
         groupby=meta["object_frame_id"],
-        x=meta["object_posx"],
-        y=meta["object_posy"],
-        skip_single=stored_config["skip_single"],
+        offset=(meta["object_posy"], meta["object_posx"]),
     )
 
-    image_large, scores_large = stitched.unpack(2)
+    # TODO: Remove recurring artefacts by looking at neighboring frames: Drop region if covered (more than x%) by more than N regions in M neighboring frames.
+
+    if stored_config["skip_single"]:
+        # DEBUG: Keep only frames with multiple regions
+        keep = Call(lambda image_large: image_large.n_regions > 1, image_large)
+        Filter(keep)
 
     labels_large = Call(segmenter_.postprocess, scores_large, image_large)
 
@@ -368,7 +365,12 @@ def build_stored_segmentation(stored_config, image, meta):
     # Extract individual objects
     region = FindRegions(labels_large, image_large, padding=75)
 
-    image = ExtractROI(image_large, region)
+    image = ExtractROI(
+        image,
+        region,
+        alpha=1 if stored_config.get("apply_mask", False) else 0,
+        bg_color=0,
+    )
 
     def recalc_metadata(region: RegionProperties, meta):
         meta = meta.copy()
@@ -493,10 +495,12 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
         image = Stitch(
             image,
             groupby=meta["object_frame_id"],
-            x=meta["object_posx"],
-            y=meta["object_posy"],
-            skip_single=config["skip_single"],
-        ).unpack(1)
+            offset=(meta["object_posy"], meta["object_posx"]),
+        )
+
+        if config["skip_single"]:
+            keep = Call(lambda image: image.n_regions > 1, image)
+            Filter(keep)
 
     # Deep Learning Segmentation
     device = config["device"]
@@ -527,6 +531,7 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
 
         return torch.from_numpy(img).contiguous()
 
+    print("Image to tile", repr(image))
     with TiledPipeline((1024, 1024), image, tile_stride=(896, 896)):
         # # Skip empty tiles
         # Filter(lambda obj: (obj[image] > 0).any())
@@ -599,9 +604,13 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
         StreamBuffer(2)
 
     # Extract individual objects
-    region = FindRegions(labels, image, padding=75)
+    region = FindRegions(
+        labels, image, padding=75, min_intensity=config["min_intensity"]
+    )
 
-    image = ExtractROI(image, region)
+    image = ExtractROI(
+        image, region, alpha=1 if config["apply_mask"] else 0, bg_color=0
+    )
 
     def recalc_metadata(region: RegionProperties, meta):
         meta = meta.copy()
@@ -714,74 +723,6 @@ def score_fn_simple(meta0, meta1):
     return overlap_xy
 
 
-@ReturnOutputs
-@Output("stitched")
-class Stitch(Node):
-    def __init__(self, *input, groupby, x, y, skip_single=False) -> None:
-        super().__init__()
-
-        self.input = input
-        self.groupby = groupby
-        self.x = x
-        self.y = y
-        self.skip_single = skip_single
-
-    def transform_stream(self, stream: Stream) -> Stream:
-        with closing_if_closable(stream):
-            stream_estimator = StreamEstimator()
-
-            for _, group in stream_groupby(stream, self.groupby):
-                group = list(group)
-
-                if self.skip_single and len(group) < 2:
-                    continue
-
-                with stream_estimator.consume(
-                    group[0].n_remaining_hint, est_n_emit=1, n_consumed=len(group)
-                ) as incoming_group:
-
-                    data = pd.DataFrame(
-                        [self.prepare_input(obj, ("input", "x", "y")) for obj in group],
-                        columns=["input", "x", "y"],
-                    )
-
-                    data[["h", "w"]] = data["input"].apply(
-                        lambda input: pd.Series(input[0].shape[:2])
-                    )
-
-                    data["xmax"] = data["x"] + data["w"]
-                    data["ymax"] = data["y"] + data["h"]
-
-                    first_input = data["input"].iloc[0]
-
-                    target_shape = (data["ymax"].max(), data["xmax"].max())
-
-                    # Create accumulator arrays
-                    # Use float to avoid overflows
-                    stitched = [
-                        np.zeros(target_shape + inp.shape[2:], dtype=float)
-                        for inp in first_input
-                    ]
-
-                    for row in data.itertuples():
-                        for i, inp in enumerate(row.input):
-                            sl = (
-                                slice(row.y, row.y + row.h),
-                                slice(row.x, row.x + row.w),
-                            )
-                            np.maximum(stitched[i][sl], inp, out=stitched[i][sl])
-
-                    stitched = [
-                        st.astype(inp.dtype) for st, inp in zip(stitched, first_input)
-                    ]
-
-                    yield self.prepare_output(
-                        group[0].copy(),
-                        stitched,
-                        n_remaining_hint=incoming_group.emit(),
-                    )
-
-
 def build_object_frame_id_filter(
     filter_object_frame_id_fn: str | None, meta: Variable[Mapping]
 ):
@@ -818,6 +759,8 @@ def build_pipeline(input, segmentation, output):
 
     logger.info(f"Found {len(data_roots):d} input directories below {input['path']}")
 
+    os.makedirs(output["path"], exist_ok=True)
+
     with Pipeline() as p:
         data_root = Unpack(data_roots)
 
@@ -826,13 +769,16 @@ def build_pipeline(input, segmentation, output):
         # Load LOG metadata
         meta = Call(read_log, data_root, meta)
 
-        # Preload all metadata (to avoid later errores due to missing fields)
+        # Preload all metadata (to avoid later validation errores)
         with AggregateErrorsPipeline():
             # Load additional metadata
             meta = Call(update_and_validate_sample_meta, data_root, meta)
 
-        # Load *all* telemetry data
-        telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
+        if input["merge_telemetry"]:
+            # Load *all* telemetry data
+            telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
+        else:
+            telemetry = None
 
         target_archive_fn = Call(
             lambda meta: os.path.join(
@@ -868,7 +814,7 @@ def build_pipeline(input, segmentation, output):
         # Parse object ID and update metadata
         meta = Call(parse_object_id, object_id, meta)
 
-        # TODO: Skip frames where no annotated objects exist
+        # Skip frames where no annotated objects exist (if configured)
         build_object_frame_id_filter(input["filter_object_frame_id"], meta)
 
         # DEBUG: Slice
@@ -901,8 +847,9 @@ def build_pipeline(input, segmentation, output):
         # Write input metadata
         EcotaxaWriter(input_meta_archive_fn, [], meta)
 
-        # Merge telemetry
-        meta = Call(merge_telemetry, meta, telemetry)
+        if telemetry is not None:
+            # Merge telemetry
+            meta = Call(merge_telemetry, meta, telemetry)
 
         image, meta = build_segmentation(segmentation, image, meta)
 
