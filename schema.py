@@ -72,6 +72,7 @@ class InputSchema(Schema):
 class EcoTaxaOutputSchema(Schema):
     path = fields.Str()
     image_fn = fields.Str(required=False)
+    scalebar = fields.Bool(load_default=False)
 
 
 class OutputSchema(Schema):

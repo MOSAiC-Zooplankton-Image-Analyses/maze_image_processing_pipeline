@@ -3,6 +3,7 @@ import datetime
 import fnmatch
 import glob
 import gzip
+import logging
 import os
 import pickle
 import traceback
@@ -23,30 +24,24 @@ from morphocut import Pipeline
 from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
 from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
-from morphocut.core import (
-    Call,
-    Variable,
-)
+from morphocut.core import Call, Variable
 from morphocut.file import Glob
-from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
-from morphocut.pipelines import (
-    AggregateErrorsPipeline,
-    DataParallelPipeline,
-    MergeNodesPipeline,
-)
+from morphocut.image import (ExtractROI, FindRegions, ImageProperties,
+                             ImageReader)
+from morphocut.pipelines import (AggregateErrorsPipeline, DataParallelPipeline,
+                                 MergeNodesPipeline)
+from morphocut.scalebar import DrawScalebar
+from morphocut.stitch import Stitch
 from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 from skimage.feature.orb import ORB
 from skimage.measure._regionprops import RegionProperties
-from morphocut.stitch import Stitch
+from tqdm import tqdm
 
 import _version
 import loki
 import segmenter
-from tqdm import tqdm
-
-import logging
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
@@ -870,6 +865,9 @@ def build_pipeline(input, segmentation, output):
         # Filter(meta["object_mc_area"] > 500)
 
         StreamBuffer(8)
+
+        if output["scalebar"]:
+            image = DrawScalebar(image, length_unit=1, px_per_unit=103, unit="mm", fg_color=255, bg_color=0)
 
         target_image_fn = Call(
             output.get("image_fn", "{object_id}.jpg").format_map, meta
