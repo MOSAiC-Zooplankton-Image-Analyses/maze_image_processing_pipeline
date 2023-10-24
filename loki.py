@@ -151,9 +151,9 @@ def read_log(fn):
     with open(fn, "r") as f:
         return dict(_parse_tmd_line(l, LOG_FIELDS) for l in f)
 
-def find_data_roots(project_root, ignore_patterns: Collection | None = None):
+def find_data_roots(project_root, ignore_patterns: Collection | None = None, progress=True):
     logger.info("Detecting project folders...")
-    with tqdm(leave=False) as progress_bar:
+    with tqdm(leave=False, disable=not progress) as progress_bar:
         for root, dirs, _ in os.walk(project_root):
             progress_bar.set_description(root, refresh=False)
             progress_bar.update(1)
