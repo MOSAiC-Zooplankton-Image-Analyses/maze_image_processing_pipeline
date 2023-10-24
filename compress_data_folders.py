@@ -9,8 +9,10 @@ from tqdm.auto import tqdm
 
 @click.command()
 @click.argument('root_dir')
-@click.option('-j', "n_processes", type=int, default=1)
-def main(root_dir, n_processes):
+@click.option('-j', "--n_workers", type=int, default=1)
+@click.option("--skip-existing", is_flag=True)
+#TODO: Skip existing
+def main(root_dir, n_workers, skip_existing):
     """
     Find and compress LOKI data folders.
     
@@ -18,7 +20,7 @@ def main(root_dir, n_processes):
     By compressing whole folders, into zip files, these are quicker to transfer and to read.
     """
 
-    executor = concurrent.futures.ThreadPoolExecutor(n_processes)
+    executor = concurrent.futures.ThreadPoolExecutor(n_workers)
 
     print("Discovering project directories...")
     futures: List[concurrent.futures.Future] = []
@@ -29,9 +31,13 @@ def main(root_dir, n_processes):
 
         archive_fn = os.path.join(root_dir, sample_id) + ".zip"
 
+        if skip_existing and os.path.isfile(archive_fn):
+            print(archive_fn, "already exists.")
+            continue
+
         print(data_root, "->", archive_fn)
         future=executor.submit(subprocess.run, ["zip", "-r", archive_fn, "."], cwd=data_root, check=True, stdout=subprocess.DEVNULL)
-        future.add_done_callback(lambda _, sample_id=sample_id: print(sample_id, "finished."))
+        future.add_done_callback(lambda _, sample_id=sample_id: print(sample_id, "finished.\n"))
         futures.append(future)
 
     print("Waiting for compression to finish...")
