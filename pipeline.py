@@ -1,13 +1,12 @@
 import contextlib
 import datetime
-import fnmatch
 import glob
 import gzip
 import logging
 import os
 import pickle
 import traceback
-from typing import Collection, Dict, Mapping, Tuple
+from typing import Dict, Mapping, Tuple
 
 import morphocut
 import numpy as np
@@ -47,23 +46,7 @@ logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
 
-def find_data_roots(project_root, ignore_patterns: Collection | None = None):
-    logger.info("Detecting project folders...")
-    with tqdm(leave=False) as progress_bar:
-        for root, dirs, _ in os.walk(project_root):
-            progress_bar.set_description(root, refresh=False)
-            progress_bar.update(1)
 
-            if ignore_patterns is not None:
-                if any(fnmatch.fnmatch(root, pat) for pat in ignore_patterns):
-                    # Do not descend further
-                    dirs[:] = []
-                    continue
-
-            if "Pictures" in dirs and "Telemetrie" in dirs:
-                yield root
-                # Do not descend further
-                dirs[:] = []
 
 
 LOG2META = {
@@ -749,7 +732,7 @@ def build_pipeline(input, segmentation, output):
 
     # List directories that contain "Pictures" and "Telemetrie" folders
     data_roots = list(
-        find_data_roots(input["path"], input.get("ignore_patterns", None))
+        loki.find_data_roots(input["path"], input.get("ignore_patterns", None))
     )
 
     logger.info(f"Found {len(data_roots):d} input directories below {input['path']}")
@@ -917,4 +900,4 @@ if __name__ == "__main__":
 
     with open(task_fn) as f:
         config = PipelineSchema().load(yaml.safe_load(f))
-        p = build_pipeline(**config)
+        p = build_pipeline(**config) # type: ignore
