@@ -38,17 +38,27 @@ class DummyExecutor(Executor):
         return fut
 
 
-class _MatchObject:
+class _MatchableObject:
+    """
+    An auxiliary class to represent a matchable object.
+
+    Args:
+        id: ID of the object.
+        score_args: Arguments that will be passed to a similarity function.
+        img: Image of the object.
+        description: Description of the object as produced by a DetectorExtractor.
+    """
+    
     def __init__(
         self,
         id: Any,
         score_args: Any,
         img: Optional[np.ndarray] = None,
-        kpd: Any = None,
+        description: Any = None,
     ) -> None:
         self.id = id
         self.img = img
-        self.kpd = kpd
+        self.description = description
         self.score_args = score_args
         self.age = 0
 
@@ -75,12 +85,12 @@ def match_hungarian(desc0, desc1, metric=None, quantile=0.9):
     return np.column_stack((ii, jj))
 
 
-def _calc_match_score(kpd0, kpd1) -> float:
-    if kpd0 is None or kpd1 is None:
+def _calc_match_score(description0, description1) -> float:
+    if description0 is None or description1 is None:
         return 0
 
-    keypts0, desc0 = kpd0
-    keypts1, desc1 = kpd1
+    keypts0, desc0 = description0
+    keypts1, desc1 = description1
 
     matches = match_hungarian(desc0, desc1)
 
@@ -115,10 +125,10 @@ def _calc_match_score(kpd0, kpd1) -> float:
 
 def _match_pair(
     score_fn,
-    prev: _MatchObject,
-    cur: _MatchObject,
+    prev: _MatchableObject,
+    cur: _MatchableObject,
 ):
-    score = _calc_match_score(prev.kpd, cur.kpd)
+    score = _calc_match_score(prev.description, cur.description)
 
     if score_fn is None:
         return score
@@ -138,13 +148,29 @@ def default_detector_extractor(img):
 
 
 class _DuplicateMatcher:
+    """
+    Auxiliary class for matching and updating duplicate objects based on specified criteria and features.
+
+    Args:
+        min_similarity (float, optional): The minimum similarity threshold for considering objects as duplicates.
+        detector_extractor (DetectorExtractor, optional): An object used for detecting and extracting features from images.
+        verbose (bool, optional): If True, produces verbose output.
+        n_workers (int, optional): The number of worker processes. If set to 1, processing is done synchronously.
+            If None then as many worker processes will be created as the machine has processors.
+        pre_score_fn (callable, optional): A callable function for calculating the similarity of two objects based on some simple criteria.
+        pre_score_thr (float, optional): A pre-score threshold for preliminary matching using scores. Objects with scores below this threshold are not considered as potential duplicates.
+            Defaults to None.
+        max_age (int, optional): The maximum age for considering objects as duplicates. Objects with an age exceeding this value are not considered.
+            Defaults to 1.
+    """
+
     def __init__(
         self,
         min_similarity=0.25,
         detector_extractor: Optional[DetectorExtractor] = None,
         verbose=False,
         n_workers=None,
-        score_fn=None,
+        pre_score_fn=None,
         pre_score_thr=None,
         max_age=1,
     ) -> None:
@@ -157,7 +183,7 @@ class _DuplicateMatcher:
 
         self.verbose = verbose
 
-        self.score_fn = score_fn
+        self.pre_score_fn = pre_score_fn
         self.pre_score_thr = pre_score_thr
 
         self.max_age = max_age
@@ -169,7 +195,7 @@ class _DuplicateMatcher:
 
     def match_and_update(self, image_ids, images, score_args):
         new_objects = [
-            _MatchObject(id, score_arg, img=img)
+            _MatchableObject(id, score_arg, img=img)
             for id, img, score_arg in zip(image_ids, images, score_args)
         ]
 
@@ -178,14 +204,14 @@ class _DuplicateMatcher:
             self._prev_objects = new_objects
             return [obj.id for obj in new_objects]
 
-        # Find matches quickly without expensive feature calculation
+        # Find matches quickly (using a pre_score_fn) without expensive feature calculation
         prev_matched = set()
         new_matched = set()
-        if self.score_fn is not None and self.pre_score_thr is not None:
+        if self.pre_score_fn is not None and self.pre_score_thr is not None:
             sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
             for i, prev in enumerate(self._prev_objects):
                 for j, cur in enumerate(new_objects):
-                    sim_matrix[i, j] = self.score_fn(0, prev.score_args, cur.score_args)
+                    sim_matrix[i, j] = self.pre_score_fn(0, prev.score_args, cur.score_args)
 
             # Find best-matching pairs
             ii, jj = linear_sum_assignment(sim_matrix, maximize=True)
@@ -204,30 +230,30 @@ class _DuplicateMatcher:
                             f"  '{old_id}' is dup of '{self._prev_objects[i].id}' ({sim_matrix[i, j]:.2f})"
                         )
 
-        # Calculate features of unmatched objects asynchronously
+        # Calculate features of still unmatched objects asynchronously
         prev_obj_fut = [
             (obj, self._executor.submit(self.detector_extractor, obj.img))
             for i, obj in enumerate(self._prev_objects)
             if i not in prev_matched
-            and obj.kpd is None  # kpd could have been calculated previously
+            and obj.description is None  # description could have been calculated previously
         ]
 
         new_obj_fut = [
             (obj, self._executor.submit(self.detector_extractor, obj.img))
             for j, obj in enumerate(new_objects)
-            if j not in new_matched  # obj.kpd is None anyways
+            if j not in new_matched  # obj.description is None for all new objects
         ]
 
         # Update match objects after feature calculation finished
         for (obj, fut) in itertools.chain(prev_obj_fut, new_obj_fut):
-            obj.kpd = fut.result()
+            obj.description = fut.result()
 
         # Match all pairs of unmatched objects asynchronously
         futures = [
             (
                 i,
                 j,
-                self._executor.submit(_match_pair, self.score_fn, prev, cur),
+                self._executor.submit(_match_pair, self.pre_score_fn, prev, cur),
             )
             for i, prev in enumerate(self._prev_objects)
             if i not in prev_matched
@@ -305,7 +331,7 @@ class DetectDuplicates(Node):
             detector_extractor=self.detector_extractor,
             verbose=self.verbose,
             n_workers=self.n_workers,
-            score_fn=self.score_fn,
+            pre_score_fn=self.score_fn,
             pre_score_thr=self.pre_score_thr,
             max_age=self.max_age,
         )
@@ -350,7 +376,7 @@ class _DuplicateMatcherSimple:
 
     def match_and_update(self, image_ids, score_args):
         new_objects = [
-            _MatchObject(id, score_arg)
+            _MatchableObject(id, score_arg)
             for id, score_arg in zip(image_ids, score_args)
         ]
 
@@ -393,6 +419,22 @@ class _DuplicateMatcherSimple:
 @ReturnOutputs
 @Output("dupset_id")
 class DetectDuplicatesSimple(Node):
+    """
+    Detecting duplicates within a data stream based on specified criteria.
+
+    Args:
+        groupby (str): The key for grouping items in the data stream.
+            All images with the same group_by key will be treated as regions on the same frame.
+        image_id (str): The key representing an individual region.
+        score_fn (callable, optional): A function to calculate the similarity score of two images.
+            Receives two `score_arg`s of two objects from two frames, respectively.
+        score_arg (optional): An argument used to calculate the similarity of two images.
+        min_similarity (float, optional): The minimum similarity threshold for considering two items as duplicates.
+        max_age (int, optional): The maximum age (number of frames in which an item is not seen) for considering items as duplicates.
+            Defaults to 1, meaning that an item must be seen consecutively to be considered a duplicate.
+        verbose (bool, optional): If True, produces verbose output.
+    """
+
     def __init__(
         self,
         groupby,
