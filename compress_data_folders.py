@@ -34,7 +34,8 @@ def main(root_dir, n_workers, skip_existing, ignore):
         archive_fn = os.path.join(root_dir, sample_id) + ".zip"
 
         if archive_fn in existing_archive_fns:
-            raise click.Abort(f"Duplicate target archive filename {archive_fn}")
+            click.echo(f"Duplicate target archive filename {archive_fn}", err=True)
+            raise click.Abort()
 
         existing_archive_fns.add(archive_fn)
 
