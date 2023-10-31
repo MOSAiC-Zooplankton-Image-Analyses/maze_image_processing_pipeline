@@ -1,8 +1,9 @@
 import logging
-from typing import Any, Collection, Tuple
+from typing import Any, Collection, Tuple, Mapping
 from tqdm.auto import tqdm
 import fnmatch
 import os
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +147,46 @@ def read_dat(fn):
         if i in DAT_FIELDS
     )
 
+_Log_to_EcoTaxa = {
+    "sample_date": "DATE",
+    "sample_time": "TIME",
+    "acq_instrument_name": "DEVICE",
+    "acq_instrument_serial": "LOKI",
+    "sample_cruise": "CRUISE",
+    "sample_station": "STATION",
+    "sample_station_no": "STATION_NR",
+    "sample_haul": "HAUL",
+    "sample_user": "USER",
+    "sample_vessel": "SHIP",
+    "sample_gps_src": "GPS_SRC",
+    "sample_latitude": "FIX_LAT",
+    "sample_longitude": "FIX_LON",
+}
 
-def read_log(fn):
+def read_log(fn, format="raw"):
     with open(fn, "r") as f:
-        return dict(_parse_tmd_line(l, LOG_FIELDS) for l in f)
+        data = dict(_parse_tmd_line(l, LOG_FIELDS) for l in f)
+
+    if format == "raw":
+        return data
+
+    if format == "ecotaxa":
+        return {ke: data[kl] for ke, kl in _Log_to_EcoTaxa.items()}
+
+    raise ValueError(f"Unknown format: {format!r}")
+
+def read_yaml_meta(meta_fn: str) -> Mapping[str, Any]:
+    if not os.path.isfile(meta_fn):
+        return {}
+
+    with open(meta_fn) as f:
+        value = yaml.unsafe_load(f)
+
+        if not isinstance(value, Mapping):
+            raise ValueError(f"Unexpected content in {meta_fn}: {value}")
+
+        return value
+
 
 def find_data_roots(project_root, ignore_patterns: Collection | None = None, progress=True):
     logger.info("Detecting project folders...")
