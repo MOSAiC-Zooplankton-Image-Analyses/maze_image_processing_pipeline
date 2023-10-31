@@ -45,36 +45,13 @@ import segmenter
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
-
-
-
-
-LOG2META = {
-    "sample_date": "DATE",
-    "sample_time": "TIME",
-    "acq_instrument_name": "DEVICE",
-    "acq_instrument_serial": "LOKI",
-    "sample_cruise": "CRUISE",
-    "sample_station": "STATION",
-    "sample_station_no": "STATION_NR",
-    "sample_haul": "HAUL",
-    "sample_user": "USER",
-    "sample_vessel": "SHIP",
-    "sample_gps_src": "GPS_SRC",
-    "sample_latitude": "FIX_LAT",
-    "sample_longitude": "FIX_LON",
-}
-
-
-def read_log(data_root: str, meta):
+def read_log_and_yaml_meta(data_root: str, meta: Mapping):
     # Find singular log filename
     (log_fn,) = glob.glob(os.path.join(data_root, "Log", "LOKI*.log"))
-
-    log = loki.read_log(log_fn)
-
-    # Return merge of existing and new meta
-    return {**meta, **{ke: log[kl] for ke, kl in LOG2META.items()}}
-
+    meta_fn = os.path.join(data_root, "meta.yaml")
+    
+    # Return combination of initial meta, LOKI log metadata and yaml meta
+    return {**meta, **loki.read_log(log_fn, format="ecotaxa"), **loki.read_yaml_meta(meta_fn)}
 
 TMD2META = {
     "object_longitude": "GPS_LON",
@@ -207,25 +184,11 @@ class MissingMetaError(Exception):
 
 
 def update_and_validate_sample_meta(data_root: str, meta: Dict):
-    """Read and validate metadata.
+    """
+    Validate metadata.
 
     Make sure that all required fields are included and generate sample_id and acq_id.
     """
-
-    meta_fn = os.path.join(data_root, "meta.yaml")
-
-    # Make a copy
-    meta = dict(meta)
-
-    # Update with additional metadata
-    if os.path.isfile(meta_fn):
-        with open(meta_fn) as f:
-            value = yaml.unsafe_load(f)
-
-            if not isinstance(value, Mapping):
-                raise ValueError(f"Unexpected content in {meta_fn}: {value}")
-
-            meta.update(value)
 
     missing_keys = set(REQUIRED_SAMPLE_META) - set(meta.keys())
     if missing_keys:
@@ -745,7 +708,7 @@ def build_pipeline(input, segmentation, output):
         Progress(data_root)
 
         # Load LOG metadata
-        meta = Call(read_log, data_root, meta)
+        meta = Call(read_log_and_yaml_meta, data_root, meta)
 
         # Preload all metadata (to avoid later validation errores)
         with AggregateErrorsPipeline():
