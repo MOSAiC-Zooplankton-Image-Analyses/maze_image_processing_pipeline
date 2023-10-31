@@ -4,9 +4,10 @@ import glob
 import gzip
 import logging
 import os
+import pathlib
 import pickle
 import traceback
-from typing import Dict, Mapping, Tuple
+from typing import IO, Dict, Iterable, List, Mapping, Protocol, Tuple
 
 import morphocut
 import numpy as np
@@ -25,10 +26,12 @@ from morphocut.contrib.ecotaxa import EcotaxaWriter
 from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
 from morphocut.core import Call, Variable
 from morphocut.file import Glob
-from morphocut.image import (ExtractROI, FindRegions, ImageProperties,
-                             ImageReader)
-from morphocut.pipelines import (AggregateErrorsPipeline, DataParallelPipeline,
-                                 MergeNodesPipeline)
+from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
+from morphocut.pipelines import (
+    AggregateErrorsPipeline,
+    DataParallelPipeline,
+    MergeNodesPipeline,
+)
 from morphocut.scalebar import DrawScalebar
 from morphocut.stitch import Stitch
 from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
@@ -37,21 +40,44 @@ from morphocut.torch import PyTorch
 from skimage.feature.orb import ORB
 from skimage.measure._regionprops import RegionProperties
 from tqdm import tqdm
+from omni_archive import Archive
 
 import _version
-import loki
+import lokidata
 import segmenter
+
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
-def read_log_and_yaml_meta(data_root: str, meta: Mapping):
+
+class _PathLike(Protocol):
+    def __truediv__(self, k) -> "_PathLike":
+        ...
+
+    def open(self) -> IO:
+        ...
+
+    def glob(self, pattern: str) -> Iterable["_PathLike"]:
+        ...
+
+    @property
+    def suffix(self) -> str:
+        ...
+
+
+def read_log_and_yaml_meta(data_root: _PathLike, meta: Mapping):
     # Find singular log filename
-    (log_fn,) = glob.glob(os.path.join(data_root, "Log", "LOKI*.log"))
-    meta_fn = os.path.join(data_root, "meta.yaml")
-    
+    (log_fn,) = (data_root / "Log").glob("LOKI*.log")
+    meta_fn = data_root / "meta.yaml"
+
     # Return combination of initial meta, LOKI log metadata and yaml meta
-    return {**meta, **loki.read_log(log_fn, format="ecotaxa"), **loki.read_yaml_meta(meta_fn)}
+    return {
+        **meta,
+        **lokidata.read_log(log_fn, format="ecotaxa"),
+        **lokidata.read_yaml(meta_fn),
+    }
+
 
 TMD2META = {
     "object_longitude": "GPS_LON",
@@ -88,20 +114,19 @@ tmd_fn_pat = "{:04d}{:02d}{:02d} {:02d}{:02d}{:02d}"
 telemetry_fn_parser = parse.compile(tmd_fn_pat)
 
 
-def parse_telemetry_fn(tmd_fn):
-    tmd_basename = os.path.basename(tmd_fn)
-    r: parse.Result = telemetry_fn_parser.search(tmd_basename)  # type: ignore
+def parse_telemetry_fn(tmd_fn: _PathLike):
+    r: parse.Result = telemetry_fn_parser.search(tmd_fn.name)  # type: ignore
     if r is None:
-        raise ValueError(f"Could not parse telemetry filename: {tmd_basename}")
+        raise ValueError(f"Could not parse telemetry filename: {tmd_fn.name}")
 
     return datetime.datetime(*r)
 
 
-def _read_tmd(tmd_fn, ignore_errors=False):
+def _read_tmd(tmd_fn: _PathLike, ignore_errors=False):
     dt = parse_telemetry_fn(tmd_fn)
 
     try:
-        tmd = loki.read_tmd(tmd_fn)
+        tmd = lokidata.read_tmd(tmd_fn)
     except:
         logger.error(f"Error reading {tmd_fn}", exc_info=True)
         if not ignore_errors:
@@ -111,12 +136,12 @@ def _read_tmd(tmd_fn, ignore_errors=False):
     return dt, {k_et: tmd[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in tmd}
 
 
-def _read_dat(dat_fn, ignore_errors=False):
+def _read_dat(dat_fn: _PathLike, ignore_errors=False):
     dt = parse_telemetry_fn(dat_fn)
 
     try:
-        dat = loki.read_dat(dat_fn)
-    except Exception as exc:
+        dat = lokidata.read_dat(dat_fn)
+    except Exception:
         logger.error(f"Error reading {dat_fn}", exc_info=True)
         if not ignore_errors:
             raise
@@ -125,12 +150,11 @@ def _read_dat(dat_fn, ignore_errors=False):
     return dt, {k_et: dat[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in dat}
 
 
-def read_all_telemetry(data_root: str, ignore_errors=False):
+def read_all_telemetry(data_root: _PathLike, ignore_errors=False):
     logger.info("Reading telemetry...")
 
-    tmd_pat = os.path.join(data_root, "Telemetrie", "*.tmd")
-    tmd_fns = glob.glob(tmd_pat)
-    tmd_names = set(os.path.splitext(tmd_fn)[0] for tmd_fn in tmd_fns)
+    tmd_fns = (data_root / "Telemetrie").glob("*.tmd")
+    tmd_names = set(tmd_fn.stem for tmd_fn in tmd_fns)
 
     telemetry = pd.DataFrame.from_dict(
         dict(
@@ -141,12 +165,12 @@ def read_all_telemetry(data_root: str, ignore_errors=False):
     )
 
     # Also read .dat files
-    dat_pat = os.path.join(data_root, "Telemetrie", "*.dat")
+    dat_fns = (data_root / "Telemetrie").glob("*.dat")
     dat = pd.DataFrame.from_dict(
         dict(
             _read_dat(dat_fn, ignore_errors=ignore_errors)
-            for dat_fn in tqdm(glob.glob(dat_pat), desc=f"{data_root}/*.dat")
-            if os.path.splitext(dat_fn)[0] not in tmd_names
+            for dat_fn in tqdm(dat_fns, desc=f"{data_root}/*.dat")
+            if dat_fn.stem not in tmd_names
         ),
         orient="index",
     )
@@ -160,7 +184,7 @@ def read_all_telemetry(data_root: str, ignore_errors=False):
 def merge_telemetry(meta: Dict, telemetry: pd.DataFrame):
     # Construct tmd_fn and extract date
     tmd_fn = "{object_date} {object_time}.tmd".format_map(meta)
-    dt = parse_telemetry_fn(tmd_fn)
+    dt = parse_telemetry_fn(pathlib.PurePosixPath(tmd_fn))
 
     (idx,) = telemetry.index.get_indexer([dt], method="nearest")
     return {**meta, **telemetry.iloc[idx].to_dict()}
@@ -679,7 +703,7 @@ def build_object_frame_id_filter(
     Filter(lambda obj: obj[meta]["object_frame_id"] in index)
 
 
-def build_pipeline(input, segmentation, output):
+def build_pipeline(input: Mapping, segmentation, output):
     """
     Args:
         input_path (str): Path to LOKI data (directory containing "Pictures" and "Telemetrie").
@@ -693,12 +717,18 @@ def build_pipeline(input, segmentation, output):
     # Set defaults
     meta.setdefault("acq_instrument", "LOKI")
 
-    # List directories that contain "Pictures" and "Telemetrie" folders
-    data_roots = list(
-        loki.find_data_roots(input["path"], input.get("ignore_patterns", None))
-    )
+    data_roots: List[_PathLike]
+    if "discover" in input:
+        # List directories that contain "Pictures" and "Telemetrie" folders
+        data_roots = list(
+            lokidata.find_data_roots(input["path"], input.get("ignore_patterns", None))
+        )
+    elif "glob" in input:
+        data_roots = [Archive(fn) for fn in glob.glob(input["glob"]["pattern"])]  # type: ignore
+    else:
+        raise ValueError("Specify one of ''discover' or 'glob' in 'input'")
 
-    logger.info(f"Found {len(data_roots):d} input directories below {input['path']}")
+    logger.info(f"Found {len(data_roots):d} input directories")
 
     os.makedirs(output["path"], exist_ok=True)
 
@@ -738,18 +768,21 @@ def build_pipeline(input, segmentation, output):
         )
 
         # Buffer per-data_root processing (telemetry, metadata)
-        StreamBuffer(1)
+        # StreamBuffer(1)
 
         Call(print, meta, "\n")
 
         # Find images
-        pictures_pat = Call(os.path.join, data_root, "Pictures", "*", "*.bmp")
-        # img_fn = Find(pictures_path, [".bmp"])
-        img_fn = Glob(pictures_pat, sorted=True)
+        picture_fns = Call(
+            lambda data_root: sorted((data_root / "Pictures").glob("*/*.bmp")),
+            data_root,
+        )
+        picture_fn = Unpack(picture_fns)
 
         # Extract object ID
         object_id = Call(
-            lambda img_fn: os.path.splitext(os.path.basename(img_fn))[0], img_fn
+            lambda picture_fn: picture_fn.stem,
+            picture_fn,
         )
 
         # Parse object ID and update metadata
@@ -771,9 +804,9 @@ def build_pipeline(input, segmentation, output):
             logger.error(f"Could not read image: {img_fn}", exc_info=True)
 
         # Skip object if image can not be loaded
-        with MergeNodesPipeline(on_error=error_handler, on_error_args=(img_fn,)):
+        with MergeNodesPipeline(on_error=error_handler, on_error_args=(picture_fn,)):
             # Read image
-            image = ImageReader(img_fn, "L")
+            image = ImageReader(picture_fn, "L")
 
         meta = Call(
             lambda image, meta: {
@@ -813,7 +846,14 @@ def build_pipeline(input, segmentation, output):
         StreamBuffer(8)
 
         if output["scalebar"]:
-            image = DrawScalebar(image, length_unit=1, px_per_unit=103, unit="mm", fg_color=255, bg_color=0)
+            image = DrawScalebar(
+                image,
+                length_unit=1,
+                px_per_unit=103,
+                unit="mm",
+                fg_color=255,
+                bg_color=0,
+            )
 
         target_image_fn = Call(
             output.get("image_fn", "{object_id}.jpg").format_map, meta
@@ -863,4 +903,4 @@ if __name__ == "__main__":
 
     with open(task_fn) as f:
         config = PipelineSchema().load(yaml.safe_load(f))
-        p = build_pipeline(**config) # type: ignore
+        p = build_pipeline(**config)  # type: ignore

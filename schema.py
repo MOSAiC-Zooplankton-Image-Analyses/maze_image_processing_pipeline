@@ -55,8 +55,13 @@ class SegmentationSchema(Schema):
     pytorch = fields.Nested(PytorchSegmentation, required=False)
 
 
+class GlobInputSchema(DefaultSchema):
+    __default_field__ = "pattern"
+    pattern = fields.Str()
+
+
 class LokiInputSchema(Schema):
-    path = fields.Str()
+    glob = fields.Nested(GlobInputSchema, required=False)
     # Process only this many objects
     slice = fields.Int(required=False)
     meta = fields.Dict(required=False)
