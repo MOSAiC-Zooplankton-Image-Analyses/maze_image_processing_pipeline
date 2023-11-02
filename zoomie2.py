@@ -3,7 +3,7 @@ import itertools
 import os
 import os.path
 import warnings
-from typing import Any, Callable, Iterable, Optional, Tuple, TypeVar
+from typing import Any, Callable, Iterable, List, Optional, Tuple, TypeVar
 from concurrent.futures import ProcessPoolExecutor, Executor
 
 import numpy as np
@@ -357,6 +357,7 @@ class DetectDuplicates(Node):
             )
             yield obj, image, image_id, score_arg
 
+T = TypeVar("T")
 
 class _DuplicateMatcherSimple:
     def __init__(
@@ -374,7 +375,7 @@ class _DuplicateMatcherSimple:
 
         self._prev_objects = []
 
-    def match_and_update(self, image_ids, score_args):
+    def match_and_update(self, image_ids: Iterable[T], score_args: Iterable) -> List[T]:
         new_objects = [
             _MatchableObject(id, score_arg)
             for id, score_arg in zip(image_ids, score_args)
@@ -465,6 +466,7 @@ class DetectDuplicatesSimple(Node):
 
         with closing_if_closable(stream):
             for _, substream in stream_groupby(stream, self.groupby):
+                image_ids: List
                 objs, image_ids, score_args = zip(*self._complete_substream(substream))
 
                 # Find matches in frame cache
