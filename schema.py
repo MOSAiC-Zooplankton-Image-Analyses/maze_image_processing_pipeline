@@ -26,13 +26,6 @@ class ThresholdSegmentation(DefaultSchema):
     threshold = fields.Number()
 
 
-class StoredSegmentation(DefaultSchema):
-    __default_field__ = "pickle_fn"
-    pickle_fn = fields.Str()
-    full_frame_archive_fn = fields.Str(load_default=None)
-    skip_single = fields.Bool(load_default=False)
-
-
 class StitchSchema(DefaultSchema):
     __default_field__ = "active"
     active = fields.Bool(load_default=False)
@@ -60,6 +53,7 @@ class PytorchSegmentation(DefaultSchema):
     min_intensity = fields.Int(load_default=None)
     apply_mask = fields.Bool(load_default=False)
     background_color = fields.Raw(load_default=0)
+    keep_background = fields.Bool(load_default=True)
 
     full_frame_archive_fn = fields.Str(load_default=None)
 
@@ -67,21 +61,22 @@ class PytorchSegmentation(DefaultSchema):
 class SegmentationSchema(Schema):
     # Segmentation
     threshold = fields.Nested(ThresholdSegmentation, required=False)
-    stored = fields.Nested(StoredSegmentation, required=False)
     pytorch = fields.Nested(PytorchSegmentation, required=False)
 
     # Filtering
     filter_expr = fields.Str(load_default=None)
 
 
-
 class GlobInputSchema(DefaultSchema):
     __default_field__ = "pattern"
     pattern = fields.Str()
 
+
 class DetectDuplicatesSchema(Schema):
     min_similarity = fields.Float(load_default=0.98)
     max_age = fields.Int(load_default=1)
+    verbose = fields.Bool(load_default=False)
+
 
 class LokiInputSchema(Schema):
     # Finding input
@@ -107,28 +102,51 @@ class InputSchema(Schema):
     loki = fields.Nested(LokiInputSchema)
 
 
-class EcoTaxaOutputSchema(Schema):
-    path = fields.Str()
-    image_fn = fields.Str(required=False, load_default="{object_id}.jpg")
+class FilterInvalidSchema(DefaultSchema):
+    __default_field__ = "max_invalid_frac"
+    max_invalid_frac = fields.Float(load_default=0.0)
+
+
+class MergeAnnotationsSchema(DefaultSchema):
+    __default_field__ = "annotations_fn"
+    annotations_fn = fields.Str(load_default=None)
+    min_overlap = fields.Float(required=False)
+    min_validated_overlap = fields.Float(required=False)
+
+
+class PostprocessingSchema(Schema):
     scalebar = fields.Bool(load_default=False)
-    store_mask = fields.Bool(load_default=False)
-    type_header = fields.Bool(load_default=True)
-    
+
     # Process only this many objects
     slice = fields.Int(load_default=None)
 
     # Detect duplicates
     detect_duplicates = fields.Nested(DetectDuplicatesSchema, load_default=None)
 
+    filter_invalid = fields.Nested(FilterInvalidSchema, load_default=None)
+
+    # Merge annotations
+    merge_annotations = fields.Nested(MergeAnnotationsSchema, load_default=None)
+
+    rescale_max_intensity = fields.Bool(load_default=False)
+
+
+class EcoTaxaOutputSchema(Schema):
+    path = fields.Str()
+    skip_existing = fields.Bool(load_default=False)
+    image_fn = fields.Str(required=False, load_default="{object_id}.jpg")
+    store_mask = fields.Bool(load_default=False)
+    type_header = fields.Bool(load_default=True)
+
 
 class OutputSchema(Schema):
     ecotaxa = fields.Nested(EcoTaxaOutputSchema)
 
 
-
 class PipelineSchema(Schema):
     input = fields.Nested(LokiInputSchema, required=True)
     segmentation = fields.Nested(SegmentationSchema)
+    postprocess = fields.Nested(PostprocessingSchema)
     output = fields.Nested(EcoTaxaOutputSchema, required=True)
 
 

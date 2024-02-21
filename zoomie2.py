@@ -1,5 +1,6 @@
 from concurrent.futures import Future
 import itertools
+import logging
 import os
 import os.path
 import warnings
@@ -22,6 +23,9 @@ from scipy.spatial.distance import cdist
 from skimage.feature import ORB
 from skimage.measure import ransac
 from skimage.transform import EuclideanTransform
+
+logging.captureWarnings(True)
+logger = logging.getLogger(__name__)
 
 
 class DummyExecutor(Executor):
@@ -48,7 +52,7 @@ class _MatchableObject:
         img: Image of the object.
         description: Description of the object as produced by a DetectorExtractor.
     """
-    
+
     def __init__(
         self,
         id: Any,
@@ -211,7 +215,9 @@ class _DuplicateMatcher:
             sim_matrix = np.zeros((len(self._prev_objects), len(new_objects)))
             for i, prev in enumerate(self._prev_objects):
                 for j, cur in enumerate(new_objects):
-                    sim_matrix[i, j] = self.pre_score_fn(0, prev.score_args, cur.score_args)
+                    sim_matrix[i, j] = self.pre_score_fn(
+                        0, prev.score_args, cur.score_args
+                    )
 
             # Find best-matching pairs
             ii, jj = linear_sum_assignment(sim_matrix, maximize=True)
@@ -235,7 +241,8 @@ class _DuplicateMatcher:
             (obj, self._executor.submit(self.detector_extractor, obj.img))
             for i, obj in enumerate(self._prev_objects)
             if i not in prev_matched
-            and obj.description is None  # description could have been calculated previously
+            and obj.description
+            is None  # description could have been calculated previously
         ]
 
         new_obj_fut = [
@@ -245,7 +252,7 @@ class _DuplicateMatcher:
         ]
 
         # Update match objects after feature calculation finished
-        for (obj, fut) in itertools.chain(prev_obj_fut, new_obj_fut):
+        for obj, fut in itertools.chain(prev_obj_fut, new_obj_fut):
             obj.description = fut.result()
 
         # Match all pairs of unmatched objects asynchronously
@@ -357,7 +364,9 @@ class DetectDuplicates(Node):
             )
             yield obj, image, image_id, score_arg
 
+
 T = TypeVar("T")
+
 
 class _DuplicateMatcherSimple:
     def __init__(
@@ -398,14 +407,17 @@ class _DuplicateMatcherSimple:
         # Update dupset IDs
         for i, j in zip(ii, jj):
             sim = sim_matrix[i, j]
+            old_id = new_objects[j].id
             if sim >= self.min_similarity:
-                old_id = new_objects[j].id
                 new_objects[j].id = self._prev_objects[i].id
 
-                if self.verbose:
-                    print(
-                        f"  '{old_id}' is dup of '{self._prev_objects[i].id}' ({sim_matrix[i, j]:.2f})"
+                if logger.isEnabledFor(logging.DEBUG):
+                    args = (self._prev_objects[i].score_args, new_objects[j].score_args)
+                    logger.debug(
+                        f"  '{old_id}' is dup of '{self._prev_objects[i].id}' {self.score_fn}({args}) = {sim_matrix[i, j]:.2f}",
                     )
+            else:
+                logger.debug(f"  '{old_id}' is no dup ({sim_matrix[i, j]:.2f})")
 
         # Update previously seen objects
         prev_objects = {
@@ -470,10 +482,10 @@ class DetectDuplicatesSimple(Node):
                 objs, image_ids, score_args = zip(*self._complete_substream(substream))
 
                 # Find matches in frame cache
-                matches = duplicate_matcher.match_and_update(image_ids, score_args)
+                dupset_ids = duplicate_matcher.match_and_update(image_ids, score_args)
 
-                for obj, match in zip(objs, matches):
-                    yield self.prepare_output(obj, match)
+                for obj, dupset_id in zip(objs, dupset_ids):
+                    yield self.prepare_output(obj, dupset_id)
 
     def _complete_substream(self, substream):
         for obj in substream:

@@ -1,15 +1,17 @@
 import contextlib
 import datetime
 import glob
-import gzip
+import itertools
 import logging
 import os
 import pathlib
-import pickle
-import traceback
-from typing import IO, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple, Union
+import warnings
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-import morphocut
+import exceptiongroup
+import natsort as ns
+
+import _version
 import numpy as np
 import pandas as pd
 import parse
@@ -20,6 +22,17 @@ import skimage.measure
 import skimage.morphology
 import yaml
 from maze_dl.merge_labels import merge_labels
+from omni_archive import Archive
+from pathlib_abc import PathBase, PurePathBase
+from pyecotaxa.archive import read_tsv
+from rich.highlighter import NullHighlighter
+from skimage.feature.orb import ORB
+from skimage.measure._regionprops import RegionProperties
+from tqdm import tqdm
+from zoomie2 import DetectDuplicatesSimple
+
+import lokidata
+import morphocut
 from morphocut import Pipeline
 from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -27,12 +40,13 @@ from morphocut.contrib.zooprocess import CalculateZooProcessFeatures
 from morphocut.core import (
     Call,
     Node,
+    Output,
     RawOrVariable,
+    ReturnOutputs,
     Stream,
     Variable,
     closing_if_closable,
 )
-from morphocut.file import Glob
 from morphocut.image import ExtractROI, FindRegions, ImageProperties, ImageReader
 from morphocut.pipelines import (
     AggregateErrorsPipeline,
@@ -44,34 +58,10 @@ from morphocut.stitch import Stitch
 from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
-from skimage.feature.orb import ORB
-from skimage.measure._regionprops import RegionProperties
-from tqdm import tqdm
-from zoomie2 import DetectDuplicatesSimple
-from omni_archive import Archive
-
-import _version
-import lokidata
-import segmenter
-
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
-
-class _PathLike(Protocol):
-    def __truediv__(self, k) -> "_PathLike":
-        ...
-
-    def open(self) -> IO:
-        ...
-
-    def glob(self, pattern: str) -> Iterable["_PathLike"]:
-        ...
-
-    @property
-    def suffix(self) -> str:
-        ...
 
 class FilterEval(Node):
     """
@@ -89,7 +79,7 @@ class FilterEval(Node):
         with closing_if_closable(stream):
             for obj in stream:
                 try:
-                    data: Mapping = self.prepare_input(obj, "data") # type: ignore
+                    data: Mapping = self.prepare_input(obj, "data")  # type: ignore
 
                     if eval(self._compiled_expr, None, data):
                         yield obj
@@ -97,7 +87,7 @@ class FilterEval(Node):
                     raise type(exc)(*exc.args, f"{self}")
 
 
-def read_log_and_yaml_meta(data_root: _PathLike, meta: Mapping):
+def read_log_and_yaml_meta(data_root: PathBase, meta: Mapping):
     # Find singular log filename
     (log_fn,) = (data_root / "Log").glob("LOKI*.log")
     meta_fn = data_root / "meta.yaml"
@@ -105,14 +95,14 @@ def read_log_and_yaml_meta(data_root: _PathLike, meta: Mapping):
     # Return combination of initial meta, LOKI log metadata and yaml meta
     return {
         **meta,
-        **lokidata.read_log(log_fn, format="ecotaxa"),
+        **lokidata.read_log(log_fn, remap_fields=lokidata.LOG_FIELDS_TO_ECOTAXA),
         **lokidata.read_yaml(meta_fn),
     }
 
 
 TMD2META = {
-    "object_longitude": "GPS_LON",
-    "object_latitude": "GPS_LAT",
+    "object_lon": "GPS_LON",
+    "object_lat": "GPS_LAT",
     "object_pressure": "PRESS",
     "object_temperature": "TEMP",  # or OXY_TEMP?
     "object_oxygen_concentration": "OXY_CON",
@@ -145,7 +135,7 @@ tmd_fn_pat = "{:04d}{:02d}{:02d} {:02d}{:02d}{:02d}"
 telemetry_fn_parser = parse.compile(tmd_fn_pat)
 
 
-def parse_telemetry_fn(tmd_fn: _PathLike):
+def parse_telemetry_fn(tmd_fn: PurePathBase):
     r: parse.Result = telemetry_fn_parser.search(tmd_fn.name)  # type: ignore
     if r is None:
         raise ValueError(f"Could not parse telemetry filename: {tmd_fn.name}")
@@ -153,7 +143,7 @@ def parse_telemetry_fn(tmd_fn: _PathLike):
     return datetime.datetime(*r)
 
 
-def _read_tmd(tmd_fn: _PathLike, ignore_errors=False):
+def _read_tmd(tmd_fn: PathBase, ignore_errors=False):
     dt = parse_telemetry_fn(tmd_fn)
 
     try:
@@ -167,7 +157,7 @@ def _read_tmd(tmd_fn: _PathLike, ignore_errors=False):
     return dt, {k_et: tmd[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in tmd}
 
 
-def _read_dat(dat_fn: _PathLike, ignore_errors=False):
+def _read_dat(dat_fn: PathBase, ignore_errors=False):
     dt = parse_telemetry_fn(dat_fn)
 
     try:
@@ -181,10 +171,12 @@ def _read_dat(dat_fn: _PathLike, ignore_errors=False):
     return dt, {k_et: dat[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in dat}
 
 
-def read_all_telemetry(data_root: _PathLike, ignore_errors=False):
-    logger.info("Reading telemetry...")
+def read_all_telemetry(data_root: PathBase, ignore_errors=False):
+    logger.info(f"Reading telemetry in {data_root}...")
 
-    tmd_fns = (data_root / "Telemetrie").glob("*.tmd")
+    telemetry_path = data_root / "Telemetrie"
+
+    tmd_fns = list(telemetry_path.glob("*.tmd"))
     tmd_names = set(tmd_fn.stem for tmd_fn in tmd_fns)
 
     telemetry = pd.DataFrame.from_dict(
@@ -196,7 +188,7 @@ def read_all_telemetry(data_root: _PathLike, ignore_errors=False):
     )
 
     # Also read .dat files
-    dat_fns = (data_root / "Telemetrie").glob("*.dat")
+    dat_fns = list(telemetry_path.glob("*.dat"))
     dat = pd.DataFrame.from_dict(
         dict(
             _read_dat(dat_fn, ignore_errors=ignore_errors)
@@ -208,6 +200,16 @@ def read_all_telemetry(data_root: _PathLike, ignore_errors=False):
     dat = dat[~dat.index.isin(telemetry.index)]
     if not dat.empty:
         telemetry = pd.concat((telemetry, dat))
+
+    if telemetry.empty:
+        files = ", ".join(
+            p.name for p in itertools.islice(telemetry_path.iterdir(), 10)
+        )
+        msg = f"{data_root}/{telemetry_path} contains no readable telemetry files, just {files}, ..."
+        if ignore_errors:
+            logger.error(msg)
+        else:
+            raise ValueError(msg)
 
     return telemetry.sort_index()
 
@@ -238,7 +240,7 @@ class MissingMetaError(Exception):
     pass
 
 
-def update_and_validate_sample_meta(data_root: str, meta: Dict):
+def update_and_validate_sample_meta(data_root: PurePathBase, meta: Dict):
     """
     Validate metadata.
 
@@ -249,6 +251,7 @@ def update_and_validate_sample_meta(data_root: str, meta: Dict):
     if missing_keys:
         missing_keys_str = ", ".join(sorted(missing_keys))
 
+        meta_fn = data_root / "meta.yaml"
         raise MissingMetaError(
             f"The following fields are missing: {missing_keys_str}.\nSupply them in {meta_fn}"
         )
@@ -286,110 +289,28 @@ def parse_object_id(object_id, meta):
     }
 
 
-def stretch_contrast(image, low, high):
-    low_, high_ = np.quantile(image, (low, high))
-    return skimage.exposure.rescale_intensity(image, (low_, high_))
+# def rescale_intensity(image, q_low: Optional[float], q_high: Optional[float]):
+#     low: float
+#     high: float
+#     if q_low is None:
+#         if q_high is None:
+#             return image
+
+#         low = skimage.exposure.exposure.intensity_range(image, "dtype")[0]
+#         high = np.quantile(image, q_high, method="median_unbiased")
+
+#     else:  # q_low is not None
+#         if q_high is None:
+#             low = np.quantile(image, q_low, method="median_unbiased")
+#             high = skimage.exposure.exposure.intensity_range(image, "dtype")[1]
+#         else:  # q_high is not None
+#             low, high = np.quantile(image, (q_low, q_high), method="median_unbiased")
+
+#     return skimage.exposure.rescale_intensity(image, (low, high))
 
 
-def build_stored_segmentation(stored_config, image, meta):
-    pickle_fn = stored_config["pickle_fn"]
-
-    with gzip.open(pickle_fn, "rb") as f:
-        segmenter_: segmenter.Segmenter = pickle.load(f)
-    segmenter_.configure(n_jobs=1, verbose=0)
-
-    def _predict_scores(image, segmenter_):
-        features = segmenter_.extract_features(image)
-        mask = segmenter_.preselect(image)
-        scores = segmenter_.predict_pixels(features, mask)
-
-        return scores
-
-    scores = Call(_predict_scores, image, segmenter_)
-
-    image_large, scores_large = Stitch(
-        image,
-        scores,
-        groupby=meta["object_frame_id"],
-        offset=(meta["object_posy"], meta["object_posx"]),
-    )
-
-    # TODO: Remove recurring artefacts by looking at neighboring frames: Drop region if covered (more than x%) by more than N regions in M neighboring frames.
-
-    if stored_config["skip_single"]:
-        # DEBUG: Keep only frames with multiple regions
-        keep = Call(lambda image_large: image_large.n_regions > 1, image_large)
-        Filter(keep)
-
-    labels_large = Call(segmenter_.postprocess, scores_large, image_large)
-
-    if stored_config["full_frame_archive_fn"] is not None:
-        segment_image = Call(
-            lambda labels, image: skimage.util.img_as_ubyte(
-                skimage.color.label2rgb(labels, image, bg_label=0, bg_color=None)
-            ),
-            labels_large,
-            image_large,
-        )
-
-        score_image = Call(
-            skimage.util.img_as_ubyte,
-            scores_large,
-        )
-
-        full_frame_archive_fn = Call(
-            str.format_map, stored_config["full_frame_archive_fn"], meta
-        )
-
-        #  Store stitched result
-        EcotaxaWriter(
-            full_frame_archive_fn,
-            [
-                # Input image
-                ("img/" + meta["object_frame_id"] + ".png", image_large),
-                # Image overlayed with labeled segments
-                ("overlay/" + meta["object_frame_id"] + ".png", segment_image),
-                ("score/" + meta["object_frame_id"] + ".png", score_image),
-                # # Mask (255=foreground)
-                # (
-                #     "mask/" + meta["object_frame_id"] + ".png",
-                #     Call(lambda labels: (labels > 0).astype("uint8")*255, labels_large),
-                # ),
-            ],
-        )
-    
-    # Extract individual objects
-    region = FindRegions(labels_large, image_large, padding=75)
-
-
-    image = ExtractROI(
-        image,
-        region,
-        alpha=1 if stored_config["apply_mask"] else 0,
-        bg_color=0,
-    )
-
-    def recalc_metadata(region: RegionProperties, meta):
-        meta = meta.copy()
-
-        (y0, x0, x1, y1) = region.bbox
-
-        meta["object_posx"] = x0
-        meta["object_posy"] = y0
-        meta["object_sequence"] = region.label
-        meta["object_width"] = x1 - x0
-        meta["object_height"] = y1 - y0
-
-        meta["object_id"] = objid_pattern.format_map(meta)
-
-        return meta
-
-    # Re-calculate metadata (object_id, posx, posy)
-    meta = Call(recalc_metadata, region, meta)
-
-    # Re-calculate features
-    meta = CalculateZooProcessFeatures(region, meta, prefix="object_")
-    return image, meta
+def rescale_max_intensity(image: np.ndarray):
+    return skimage.exposure.rescale_intensity(image, (0, image.max()))
 
 
 def assert_compatible_shape(label, image):
@@ -448,7 +369,10 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
         )
 
         if config["clear_border"]:
-            Call(lambda labels: skimage.segmentation.clear_border(labels, out=labels), labels)
+            Call(
+                lambda labels: skimage.segmentation.clear_border(labels, out=labels),
+                labels,
+            )
 
         # Remove objects below area threshold
         if config["min_area"] > 0:
@@ -531,7 +455,6 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
 
         return torch.from_numpy(img).contiguous()
 
-    print("Image to tile", repr(image))
     with TiledPipeline((1024, 1024), image, tile_stride=(896, 896)):
         # # Skip empty tiles
         # Filter(lambda obj: (obj[image] > 0).any())
@@ -554,7 +477,7 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
                 device=device,
                 output_key=0,
                 pre_transform=pre_transform,
-                pin_memory=True,
+                pin_memory=device.startswith("cuda"),
                 autocast=config["autocast"],
             )
 
@@ -609,7 +532,11 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
     )
 
     image = ExtractROI(
-        image, region, alpha=1 if config["apply_mask"] else 0, bg_color=config["background_color"]
+        image,
+        region,
+        alpha=1 if config["apply_mask"] else 0,
+        bg_color=config["background_color"],
+        keep_background=config["keep_background"],
     )
 
     def recalc_metadata(region: RegionProperties, meta):
@@ -624,6 +551,8 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
         meta["object_height"] = y1 - y0
 
         meta["object_id"] = objid_pattern.format_map(meta)
+
+        meta["object_frac_invalid"] = (region.image_intensity[region.image] == 0).mean()
 
         return meta
 
@@ -677,16 +606,16 @@ def build_segmentation(config, image, meta) -> Tuple[Variable, Variable, RawOrVa
     if segmentation_type is None:
         raise ValueError(f"No segmentation type specified")
     elif segmentation_type == "threshold":
-        image, meta= build_threshold_segmentation(segmentation_config, image, meta)
-    elif segmentation_type == "stored":
-        image, meta=build_stored_segmentation(segmentation_config, image, meta)
+        image, meta = build_threshold_segmentation(segmentation_config, image, meta)
     elif segmentation_type == "pytorch":
         image, meta, mask = build_pytorch_segmentation(segmentation_config, image, meta)
     else:
         raise ValueError(f"Unknown segmentation config: {config}")
-    
+
     if config["filter_expr"] is not None:
-        logger.info(f"Filtering output by expression {config['filter_expr']!r}")
+        logger.info(
+            f"Filtering segmentation results by expression {config['filter_expr']!r}"
+        )
         FilterEval(config["filter_expr"], meta)
 
     return image, meta, mask
@@ -767,17 +696,20 @@ def build_object_frame_id_filter(
 
     Filter(lambda obj: obj[meta]["object_frame_id"] in index)
 
+
 def build_input(input_config: Mapping, output_config: Mapping):
     meta = input_config.get("meta", {})
 
     # Set defaults
     meta.setdefault("acq_instrument", "LOKI")
 
-    data_roots: List[_PathLike]
+    data_roots: List[PathBase]
     if "discover" in input_config:
         # List directories that contain "Pictures" and "Telemetrie" folders
         data_roots = list(
-            lokidata.find_data_roots(input_config["path"], input_config.get("ignore_patterns", None))
+            lokidata.find_data_roots(
+                input_config["path"], input_config.get("ignore_patterns", None)
+            )
         )
     elif "glob" in input_config:
         data_roots = [Archive(fn) for fn in glob.glob(input_config["glob"]["pattern"])]  # type: ignore
@@ -786,7 +718,7 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
     logger.info(f"Found {len(data_roots):d} input directories")
 
-    data_root = Unpack(data_roots)
+    data_root = Unpack(ns.natsorted(data_roots, alg=ns.PATH | ns.IGNORECASE))
 
     Progress(data_root)
 
@@ -795,14 +727,22 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
     # Preload all metadata (to avoid later validation errores)
     with AggregateErrorsPipeline():
-        # Load additional metadata
+        # Generate additional metadata and validate
         meta = Call(update_and_validate_sample_meta, data_root, meta)
 
-    if input_config["merge_telemetry"]:
-        # Load *all* telemetry data
-        telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
-    else:
-        telemetry = None
+        if input_config["merge_telemetry"]:
+            # Load *all* telemetry data
+            telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
+        else:
+            telemetry = None
+
+        # Unload archives so that they don't stack up in memory while aggregating metadata and telemetry
+        Call(
+            lambda data_root: (
+                data_root.close() if hasattr(data_root, "close") else None
+            ),
+            data_root,
+        )
 
     os.makedirs(output_config["path"], exist_ok=True)
 
@@ -814,27 +754,49 @@ def build_input(input_config: Mapping, output_config: Mapping):
         meta,
     )
 
+    if output_config["skip_existing"]:
+
+        def check_not_exists(target_archive_fn):
+            if not os.path.exists(target_archive_fn):
+                return True
+
+            logger.info(f"Skipping target '{target_archive_fn}'.")
+            return False
+
+        Filter(Call(check_not_exists, target_archive_fn))
+
     if input_config["save_meta"]:
         input_meta_archive_fn = Call(
             lambda meta: os.path.join(
                 output_config["path"],
-                "LOKI_{sample_station}_{sample_haul}_input_meta.zip".format_map(
-                    meta
-                ),
+                "LOKI_{sample_station}_{sample_haul}_input_meta.zip".format_map(meta),
             ),
             meta,
         )
 
     # Buffer per-data_root processing (telemetry, metadata)
-    # StreamBuffer(1)
+    StreamBuffer(1)
 
-    Call(print, meta, "\n")
+    # Call(print, meta, "\n")
 
     # Find images
     picture_fns = Call(
-        lambda data_root: sorted((data_root / "Pictures").glob("*/*.bmp")),
+        lambda data_root: sorted(
+            path
+            for path in (data_root / "Pictures").glob("*/*.*")
+            if path.suffix in [".jpg", ".bmp", ".png"]
+        ),
         data_root,
     )
+
+    Call(
+        lambda picture_fns, data_root: logger.info(
+            f"{len(picture_fns)} input images in {data_root}."
+        ),
+        picture_fns,
+        data_root,
+    )
+
     picture_fn = Unpack(picture_fns)
 
     # Extract object ID
@@ -851,11 +813,13 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
     # DEBUG: Slice
     if input_config["slice"] is not None:
-        logger.warning(f"Only processing the first {input_config['slice']} input objects.")
+        logger.warning(
+            f"Only processing the first {input_config['slice']} input objects."
+        )
         Slice(input_config["slice"])
 
     def error_handler(exc, img_fn):
-        traceback.print_exc(file=sys.stderr)
+        exceptiongroup.print_exc(file=sys.stderr)
         logger.error(f"Could not read image: {img_fn}", exc_info=True)
 
     # Skip object if image can not be loaded
@@ -880,7 +844,7 @@ def build_input(input_config: Mapping, output_config: Mapping):
         FilterEval(input_config["filter_expr"], meta)
 
     # Detect duplicates
-    build_duplicate_detection(input_config["detect_duplicates"], image, meta)
+    build_duplicate_detection(input_config["detect_duplicates"], image, meta, "input")
 
     if input_config["save_meta"]:
         # Write input metadata
@@ -892,10 +856,17 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
     return image, meta, target_archive_fn
 
-def build_duplicate_detection(detect_duplicates_config: Optional[Mapping], image, meta):
+
+def build_duplicate_detection(
+    detect_duplicates_config: Optional[Mapping], image, meta, where: str
+):
     if detect_duplicates_config is None:
         return
-    
+
+    logger.info(
+        f"Duplicate detection ({where}) is active ({detect_duplicates_config})."
+    )
+
     # Detect duplicates
     dupset_id = DetectDuplicatesSimple(
         meta["object_frame_id"],
@@ -904,14 +875,97 @@ def build_duplicate_detection(detect_duplicates_config: Optional[Mapping], image
         score_arg=meta,
         min_similarity=detect_duplicates_config["min_similarity"],
         max_age=detect_duplicates_config["max_age"],
-        verbose=False,
+        verbose=detect_duplicates_config["verbose"],
     )
 
-    # Only keep unique objects
-    Filter(dupset_id == meta["object_id"])
-        
+    # Only keep the first object of each duplicate set
+    def keep_duplicate(dupset_id, meta):
+        if dupset_id == meta["object_id"]:
+            return True
 
-def build_pipeline(pipeline_config: Mapping):
+        logger.info(f"Dropping duplicate ({where}): {meta['object_id']}")
+        return False
+
+    Filter(Call(keep_duplicate, dupset_id, meta))
+
+
+@ReturnOutputs
+@Output("meta")
+class MergeAnnotations(Node):
+    def __init__(
+        self, meta, *, annotations_fn: str, min_overlap=0.5, min_validated_overlap=0.8
+    ):
+        super().__init__()
+
+        self.meta = meta
+
+        self.min_overlap = min_overlap
+        self.min_validated_overlap = min_validated_overlap
+
+        annotations = read_tsv(annotations_fn)
+
+        missing_fields = {
+            "object_width",
+            "object_height",
+            "object_posx",
+            "object_posy",
+        } - set(annotations.columns)
+        if missing_fields:
+            raise ValueError(
+                f"The following fields are missing: {sorted(missing_fields)}"
+            )
+
+        self._annotations_by_frame_id = annotations.groupby("object_frame_id")
+        self._annotation_columns = [
+            c for c in annotations.columns if c.startswith("object_annotation")
+        ]
+
+    def transform(self, meta: dict) -> dict:
+        object_frame_id = meta["object_frame_id"]
+
+        try:
+            frame_annotations: pd.DataFrame = self._annotations_by_frame_id.get_group(
+                object_frame_id
+            )
+        except KeyError:
+            return meta
+
+        if not frame_annotations.size:
+            return meta
+
+        def _calc_overlap_xy(annotation: pd.Series) -> float:
+            meta0 = annotation.to_dict()
+
+            return score_fn_simple(meta0, meta)
+
+        # Match object by overlap
+        overlap_xy = frame_annotations.apply(_calc_overlap_xy, axis=1)
+        best_idx = overlap_xy.sort_values(ascending=False).index[0]
+
+        best_overlap = overlap_xy[best_idx]
+
+        meta["object_annotation_merge_overlap"] = best_overlap
+
+        if best_overlap > self.min_overlap:
+            annotation_meta = frame_annotations.loc[
+                best_idx, self._annotation_columns
+            ].to_dict()
+
+            # Downgrade to dubious if match is imperfect
+            if (
+                best_overlap < self.min_validated_overlap
+                and annotation_meta["object_annotation_status"] == "validated"
+            ):
+                annotation_meta["object_annotation_status"] = "dubious"
+        else:
+            annotation_meta = {k: "" for k in self._annotation_columns}
+
+        meta.update(annotation_meta)
+
+        return meta
+
+
+def build_and_run_pipeline(pipeline_config: Mapping):
     """
     Args:
         input_path (str): Path to LOKI data (directory containing "Pictures" and "Telemetrie").
@@ -921,55 +975,91 @@ def build_pipeline(pipeline_config: Mapping):
     """
 
     with Pipeline() as p:
-        image, meta, target_archive_fn = build_input(pipeline_config["input"], pipeline_config["output"])
+        image, meta, target_archive_fn = build_input(
+            pipeline_config["input"], pipeline_config["output"]
+        )
 
-        Progress()
+        Progress("Input objects")
 
-        image, meta, mask = build_segmentation(pipeline_config["segmentation"], image, meta)
+        image, meta, mask = build_segmentation(
+            pipeline_config["segmentation"], image, meta
+        )
 
         StreamBuffer(8)
 
-        build_duplicate_detection(pipeline_config["output"]["detect_duplicates"], image, meta)
+        # Post-Processing
+        postprocess_config = pipeline_config["postprocess"]
 
-        output_config = pipeline_config["output"]
-        if output_config["scalebar"]:
+        build_duplicate_detection(
+            postprocess_config["detect_duplicates"], image, meta, "output"
+        )
+
+        if postprocess_config["filter_invalid"]:
+            raise NotImplementedError()
+            # build_invalid_detection(pipeline_config["output"]["detect_invalid"], image, mask)
+
+        if postprocess_config["rescale_max_intensity"]:
+            logger.info(f"Rescaling intensity of output images")
+            # Image enhancement: Stretch contrast
+            image = Call(rescale_max_intensity, image)
+
+        if postprocess_config["scalebar"]:
+            logger.info("Drawing scalebar")
             image = DrawScalebar(
                 image,
-                length_unit=1,
+                length_in_unit=1,
                 px_per_unit=103,
                 unit="mm",
                 fg_color=255,
                 bg_color=0,
             )
 
+        if postprocess_config["merge_annotations"] is not None:
+            logger.info(
+                f"Merging annotations: {postprocess_config['merge_annotations']}"
+            )
+            meta = MergeAnnotations(meta, **postprocess_config["merge_annotations"])
 
         # DEBUG: Slice
-        if output_config["slice"] is not None:
-            logger.warning(f"Only processing the first {output_config['slice']} output objects.")
-            Slice(output_config["slice"])
+        if postprocess_config["slice"] is not None:
+            logger.warning(
+                f"Only processing the first {postprocess_config['slice']} output objects."
+            )
+            Slice(postprocess_config["slice"])
 
-        # # # Image enhancement: Stretch contrast
-        # # image = Call(stretch_contrast, image, 0.01, 0.99)
-
-        target_image_fn = Call(
-            output_config["image_fn"].format_map, meta
-        )
+        output_config = pipeline_config["output"]
+        target_image_fn = Call(output_config["image_fn"].format_map, meta)
         output_images = [(target_image_fn, image)]
         if output_config["store_mask"]:
             target_mask_fn = Call(filename_suffix, target_image_fn, "_mask")
             output_images.append((target_mask_fn, mask))
 
-        EcotaxaWriter(target_archive_fn, output_images, meta, store_types=output_config["type_header"])
+        EcotaxaWriter(
+            target_archive_fn,
+            output_images,
+            meta,
+            store_types=output_config["type_header"],
+        )
 
-    p.run()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            "Only one label was provided to `remove_small_objects`",
+            UserWarning,
+        )
+
+        p.run()
+
 
 def filename_suffix(fn: str, suffix: str):
     stem, ext = os.path.splitext(fn)
     return stem + suffix + ext
 
+
 if __name__ == "__main__":
     import sys
 
+    from rich.logging import RichHandler
     from schema import PipelineSchema
 
     if len(sys.argv) != 2:
@@ -981,26 +1071,51 @@ if __name__ == "__main__":
 
     os.chdir(os.path.dirname(task_fn))
 
+    task_name = os.path.splitext(os.path.basename(task_fn))[0]
+    task_fn_modified = datetime.datetime.fromtimestamp(os.stat(task_fn).st_mtime)
+
     # Setup logging
     log_fn = os.path.abspath(
-        f'loki_pipeline-{datetime.datetime.now().isoformat(timespec="seconds")}.log'
+        f'{task_name}-{datetime.datetime.now().isoformat(timespec="seconds")}.log'
     )
     print(f"Logging to {log_fn}.")
     file_handler = logging.FileHandler(log_fn)
-    file_handler.setLevel(logging.INFO)
-    stream_handler = logging.StreamHandler()
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    logger.setLevel(logging.INFO)
+    stream_handler = RichHandler(highlighter=NullHighlighter())
+    stream_handler.setLevel(logging.DEBUG)
 
-    # Also capture py.warnings
-    warnings_logger = logging.getLogger("py.warnings")
-    warnings_logger.addHandler(file_handler)
-    warnings_logger.addHandler(stream_handler)
-    logger.setLevel(logging.INFO)
+    root_logger = logging.getLogger()
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+    root_logger.setLevel(logging.INFO)
+
+    # Also capture exceptions
+
+    def log_except_hook(*exc_info):
+        root_logger.error("Unhandled exception", exc_info=exc_info)  # type: ignore
+
+    sys.excepthook = log_except_hook
+
+    # # Also capture py.warnings
+    # warnings_logger = logging.getLogger("py.warnings")
+    # warnings_logger.addHandler(file_handler)
+    # warnings_logger.addHandler(stream_handler)
+    # warnings_logger.setLevel(logging.INFO)
+
+    root_logger.info(
+        f"Loading pipeline config from {task_fn} ({task_fn_modified.isoformat(timespec='seconds')})"
+    )
+
+    # logging.getLogger("zoomie2").setLevel(logging.DEBUG)
+
+    log_levels = {
+        name: logging.getLevelName(logging.getLogger(name).getEffectiveLevel())
+        for name in sorted(root_logger.manager.loggerDict)
+    }
+    root_logger.info(f"Log levels: {log_levels}")
 
     with open(task_fn) as f:
         config = PipelineSchema().load(yaml.safe_load(f))
-        p = build_pipeline(config)  # type: ignore
+        p = build_and_run_pipeline(config)  # type: ignore
