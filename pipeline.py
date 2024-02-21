@@ -725,7 +725,7 @@ def calc_overlap(xy0, wh0, xy1, wh1):
     b1 = xy1[1] + wh1[1]
 
     w0, h0 = wh0
-    w1, h1 = wh0
+    w1, h1 = wh1
 
     intersect_x = max(0, min(r0, r1) - max(l0, l1))
     intersect_y = max(0, min(b0, b1) - max(t0, t1))
