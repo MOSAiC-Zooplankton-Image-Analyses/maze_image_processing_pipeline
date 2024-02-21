@@ -893,7 +893,12 @@ def build_duplicate_detection(
 @Output("meta")
 class MergeAnnotations(Node):
     def __init__(
-        self, meta, *, annotations_fn: str, min_overlap=0.5, min_validated_overlap=0.8
+        self,
+        meta,
+        *,
+        annotations_fn: str,
+        min_overlap=0.5,
+        min_validated_overlap=0.8,
     ):
         super().__init__()
 
@@ -951,12 +956,11 @@ class MergeAnnotations(Node):
                 best_idx, self._annotation_columns
             ].to_dict()
 
-            # Downgrade to dubious if match is imperfect
-            if (
-                best_overlap < self.min_validated_overlap
-                and annotation_meta["object_annotation_status"] == "validated"
-            ):
-                annotation_meta["object_annotation_status"] = "dubious"
+            # Downgrade annotation status if match is imperfect
+            if best_overlap < self.min_validated_overlap and annotation_meta[
+                "object_annotation_status"
+            ] in ("validated", "dubious"):
+                annotation_meta["object_annotation_status"] = "predicted"
         else:
             annotation_meta = {k: "" for k in self._annotation_columns}
 
