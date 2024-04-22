@@ -1,0 +1,30 @@
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3
+  - pytorch==1.12.1
+  - torchvision==0.13.1
+  - pytorch-cuda=11.6
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - numpy
+  - pandas
+  - joblib
+  - h5py
+  - pip
+  - notebook
+  - ipykernel
+  # - jupyter_contrib_nbextensions
+  - ipympl
+  - black
+  - scipy
+  - pip:
+    - timer_cm
+    - natsort
+    - envparse
+    - marshmallow
+    - omni-archive
