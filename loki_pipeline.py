@@ -1,12 +1,13 @@
 import contextlib
 import datetime
+import fnmatch
 import glob
 import itertools
 import logging
 import os
 import pathlib
 import warnings
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import exceptiongroup
 import natsort as ns
@@ -21,7 +22,7 @@ import skimage.filters
 import skimage.measure
 import skimage.morphology
 import yaml
-from maze_dl.merge_labels import merge_labels
+from merge_labels import merge_labels
 from omni_archive import Archive
 from pathlib_abc import PathBase, PurePathBase
 from pyecotaxa.archive import read_tsv
@@ -171,56 +172,97 @@ def _read_dat(dat_fn: PathBase, ignore_errors=False):
     return dt, {k_et: dat[k_loki] for k_et, k_loki in TMD2META.items() if k_loki in dat}
 
 
-def read_all_telemetry(data_root: PathBase, ignore_errors=False):
-    logger.info(f"Reading telemetry in {data_root}...")
+class Telemetry:
+    def __init__(
+        self,
+        data_root: PathBase,
+        ignore_errors=False,
+        tolerance: Union[None, str, pd.Timedelta] = None,
+    ):
+        self.telemetry = self._read_all_telemetry(data_root, ignore_errors)
 
-    telemetry_path = data_root / "Telemetrie"
+        median_timedelta = pd.Series(self.telemetry.index).diff().median()
 
-    tmd_fns = list(telemetry_path.glob("*.tmd"))
-    tmd_names = set(tmd_fn.stem for tmd_fn in tmd_fns)
-
-    telemetry = pd.DataFrame.from_dict(
-        dict(
-            _read_tmd(tmd_fn, ignore_errors=ignore_errors)
-            for tmd_fn in tqdm(tmd_fns, desc=f"{data_root}/*.tmd")
-        ),
-        orient="index",
-    )
-
-    # Also read .dat files
-    dat_fns = list(telemetry_path.glob("*.dat"))
-    dat = pd.DataFrame.from_dict(
-        dict(
-            _read_dat(dat_fn, ignore_errors=ignore_errors)
-            for dat_fn in tqdm(dat_fns, desc=f"{data_root}/*.dat")
-            if dat_fn.stem not in tmd_names
-        ),
-        orient="index",
-    )
-    dat = dat[~dat.index.isin(telemetry.index)]
-    if not dat.empty:
-        telemetry = pd.concat((telemetry, dat))
-
-    if telemetry.empty:
-        files = ", ".join(
-            p.name for p in itertools.islice(telemetry_path.iterdir(), 10)
+        logger.info(
+            f"Read telemetry for {data_root}. Median time delta is {median_timedelta}."
         )
-        msg = f"{data_root}/{telemetry_path} contains no readable telemetry files, just {files}, ..."
-        if ignore_errors:
-            logger.error(msg)
-        else:
-            raise ValueError(msg)
 
-    return telemetry.sort_index()
+        if isinstance(tolerance, str):
+            tolerance = pd.Timedelta(tolerance)
 
+        self.tolerance = tolerance
 
-def merge_telemetry(meta: Dict, telemetry: pd.DataFrame):
-    # Construct tmd_fn and extract date
-    tmd_fn = "{object_date} {object_time}.tmd".format_map(meta)
-    dt = parse_telemetry_fn(pathlib.PurePosixPath(tmd_fn))
+        self._not_found_dt = set()
 
-    (idx,) = telemetry.index.get_indexer([dt], method="nearest")
-    return {**meta, **telemetry.iloc[idx].to_dict()}
+    @staticmethod
+    def _read_all_telemetry(data_root: PathBase, ignore_errors=False) -> pd.DataFrame:
+        logger.info(f"Reading telemetry in {data_root}...")
+
+        telemetry_path = data_root / "Telemetrie"
+
+        tmd_fns = list(telemetry_path.glob("*.tmd"))
+        tmd_names = set(tmd_fn.stem for tmd_fn in tmd_fns)
+
+        logger.info(f"Found {len(tmd_fns)} *.tmd files")
+        telemetry = pd.DataFrame.from_dict(
+            dict(
+                _read_tmd(tmd_fn, ignore_errors=ignore_errors)
+                for tmd_fn in tqdm(tmd_fns, desc=f"{telemetry_path}/*.tmd")
+            ),
+            orient="index",
+        )
+
+        # Also read .dat files
+        dat_fns = list(telemetry_path.glob("*.dat"))
+        logger.info(f"Found {len(dat_fns)} *.dat files")
+        dat = pd.DataFrame.from_dict(
+            dict(
+                _read_dat(dat_fn, ignore_errors=ignore_errors)
+                for dat_fn in tqdm(dat_fns, desc=f"{telemetry_path}/*.dat")
+                if dat_fn.stem not in tmd_names
+            ),
+            orient="index",
+        )
+        dat = dat[~dat.index.isin(telemetry.index)]
+        if not dat.empty:
+            telemetry = pd.concat((telemetry, dat))
+
+        if telemetry.empty:
+            files = list(p.name for p in itertools.islice(telemetry_path.iterdir(), 10))
+            if len(files) == 10:
+                files[-1] = "..."
+
+            msg = f"{data_root}/{telemetry_path} contains no readable telemetry files, just {', '.join(files)}"
+            if ignore_errors:
+                logger.error(msg)
+            else:
+                raise ValueError(msg)
+
+        telemetry.index = telemetry.index.astype("datetime64[ns]")
+
+        return telemetry.sort_index()
+
+    def merge_telemetry(
+        self,
+        meta: Dict,
+    ):
+        # Construct tmd_fn and extract date
+        tmd_fn = "{object_date} {object_time}.tmd".format_map(meta)
+        dt = parse_telemetry_fn(pathlib.PurePosixPath(tmd_fn))
+
+        (idx,) = self.telemetry.index.get_indexer(
+            [dt], method="nearest", tolerance=self.tolerance
+        )
+
+        # Missing values in the target are marked by -1.
+        if idx == -1:
+            if dt not in self._not_found_dt:
+                logger.warn(f"No telemetry found for {dt}")
+                self._not_found_dt.add(dt)
+
+            return meta
+
+        return {**meta, **self.telemetry.iloc[idx].to_dict()}
 
 
 REQUIRED_SAMPLE_META = [
@@ -351,7 +393,10 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
             foreground_pred = Call(
                 skimage.morphology.binary_opening,
                 foreground_pred,
-                skimage.morphology.disk(config["opening_radius"]),
+                skimage.morphology.disk(
+                    config["opening_radius"],
+                    decomposition="crosses",
+                ),
             )
 
         # Closing (close small gaps)
@@ -359,7 +404,10 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
             foreground_pred = Call(
                 skimage.morphology.binary_closing,
                 foreground_pred,
-                skimage.morphology.disk(config["closing_radius"]),
+                skimage.morphology.disk(
+                    config["closing_radius"],
+                    decomposition="crosses",
+                ),
             )
 
         # Label the image
@@ -528,7 +576,10 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
 
     # Extract individual objects
     region = FindRegions(
-        labels, image, padding=75, min_intensity=config["min_intensity"]
+        labels,
+        image,
+        padding=config["padding"],
+        min_intensity=config["min_intensity"],
     )
 
     image = ExtractROI(
@@ -697,6 +748,17 @@ def build_object_frame_id_filter(
     Filter(lambda obj: obj[meta]["object_frame_id"] in index)
 
 
+def _find_files_glob(pattern: str, ignore_patterns: Collection | None = None):
+    for fn in glob.iglob(pattern):
+        if ignore_patterns is not None and any(
+            fnmatch.fnmatch(fn, pat) for pat in ignore_patterns
+        ):
+            logger.info(f"Ignoring {fn}.")
+            continue
+
+        yield fn
+
+
 def build_input(input_config: Mapping, output_config: Mapping):
     meta = input_config.get("meta", {})
 
@@ -712,9 +774,10 @@ def build_input(input_config: Mapping, output_config: Mapping):
             )
         )
     elif "glob" in input_config:
-        data_roots = [Archive(fn) for fn in glob.glob(input_config["glob"]["pattern"])]  # type: ignore
+        glob_config = input_config["glob"]
+        data_roots = [Archive(fn) for fn in _find_files_glob(glob_config["pattern"], glob_config["ignore_patterns"])]  # type: ignore
     else:
-        raise ValueError("Specify one of ''discover' or 'glob' in 'input'")
+        raise ValueError("Specify one of 'discover' or 'glob' in 'input'")
 
     logger.info(f"Found {len(data_roots):d} input directories")
 
@@ -730,9 +793,16 @@ def build_input(input_config: Mapping, output_config: Mapping):
         # Generate additional metadata and validate
         meta = Call(update_and_validate_sample_meta, data_root, meta)
 
-        if input_config["merge_telemetry"]:
+        # TODO: Drop ignored `data_root`s
+
+        if input_config["merge_telemetry"] is not None:
+            telemetry_config = input_config["merge_telemetry"]
+            logger.info(f"Merging telemetry: {telemetry_config}")
+
             # Load *all* telemetry data
-            telemetry = Call(read_all_telemetry, data_root, ignore_errors=True)
+            telemetry = Call(
+                Telemetry, data_root, ignore_errors=True, **telemetry_config
+            )
         else:
             telemetry = None
 
@@ -852,7 +922,7 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
     if telemetry is not None:
         # Merge telemetry
-        meta = Call(merge_telemetry, meta, telemetry)
+        meta = Call(Telemetry.merge_telemetry, telemetry, meta)
 
     return image, meta, target_archive_fn
 
@@ -883,7 +953,7 @@ def build_duplicate_detection(
         if dupset_id == meta["object_id"]:
             return True
 
-        logger.info(f"Dropping duplicate ({where}): {meta['object_id']}")
+        logger.info(f"Dropping duplicate ({where}): {meta['object_id']} of {dupset_id}")
         return False
 
     Filter(Call(keep_duplicate, dupset_id, meta))
@@ -952,6 +1022,7 @@ class MergeAnnotations(Node):
         meta["object_annotation_merge_overlap"] = best_overlap
 
         if best_overlap > self.min_overlap:
+            # A match was found
             annotation_meta = frame_annotations.loc[
                 best_idx, self._annotation_columns
             ].to_dict()
@@ -961,7 +1032,12 @@ class MergeAnnotations(Node):
                 "object_annotation_status"
             ] in ("validated", "dubious"):
                 annotation_meta["object_annotation_status"] = "predicted"
+
+            annotation_meta["object_annotation_merge_src"] = frame_annotations.at[
+                best_idx, "object_id"
+            ]
         else:
+            # No match was found
             annotation_meta = {k: "" for k in self._annotation_columns}
 
         meta.update(annotation_meta)
@@ -1008,6 +1084,7 @@ def build_and_run_pipeline(pipeline_config: Mapping):
             image = Call(rescale_max_intensity, image)
 
         if postprocess_config["scalebar"]:
+            # TODO: Write scale bar info to processing details
             logger.info("Drawing scalebar")
             image = DrawScalebar(
                 image,
@@ -1031,7 +1108,15 @@ def build_and_run_pipeline(pipeline_config: Mapping):
             )
             Slice(postprocess_config["slice"])
 
+        ## Output
         output_config = pipeline_config["output"]
+
+        if output_config["filter_expr"] is not None:
+            logger.info(
+                f"Filtering output by expression {output_config['filter_expr']!r}"
+            )
+            FilterEval(output_config["filter_expr"], meta)
+
         target_image_fn = Call(output_config["image_fn"].format_map, meta)
         output_images = [(target_image_fn, image)]
         if output_config["store_mask"]:

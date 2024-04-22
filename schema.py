@@ -50,6 +50,7 @@ class PytorchSegmentation(DefaultSchema):
     postprocess = fields.Nested(SegmentationPostprocessingSchema, required=False)
 
     # Settings for ExtractROI
+    padding = fields.Int(load_default=75)
     min_intensity = fields.Int(load_default=None)
     apply_mask = fields.Bool(load_default=False)
     background_color = fields.Raw(load_default=0)
@@ -70,12 +71,18 @@ class SegmentationSchema(Schema):
 class GlobInputSchema(DefaultSchema):
     __default_field__ = "pattern"
     pattern = fields.Str()
+    ignore_patterns = fields.List(fields.Str(), load_default=None)
 
 
 class DetectDuplicatesSchema(Schema):
     min_similarity = fields.Float(load_default=0.98)
     max_age = fields.Int(load_default=1)
     verbose = fields.Bool(load_default=False)
+
+
+class MergeTelemetrySchema(Schema):
+    # A string denoting a time difference (e.g. 5 minutes: "5m")
+    tolerance = fields.Str(load_default=None)
 
 
 class LokiInputSchema(Schema):
@@ -91,7 +98,7 @@ class LokiInputSchema(Schema):
     meta = fields.Dict(required=False)
     filter_object_frame_id = fields.Str(load_default=None)
     ignore_patterns = fields.List(fields.Str, required=False)
-    merge_telemetry = fields.Bool(load_default=True)
+    merge_telemetry = fields.Nested(MergeTelemetrySchema, load_default={})
     save_meta = fields.Bool(load_default=False)
 
     # Detect duplicates
@@ -137,6 +144,9 @@ class EcoTaxaOutputSchema(Schema):
     image_fn = fields.Str(required=False, load_default="{object_id}.jpg")
     store_mask = fields.Bool(load_default=False)
     type_header = fields.Bool(load_default=True)
+
+    # Filtering
+    filter_expr = fields.Str(load_default=None)
 
 
 class OutputSchema(Schema):
