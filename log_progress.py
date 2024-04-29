@@ -56,18 +56,19 @@ class ProgressLogger:
         self.n_done = 0
         self.t_last_update = time.time()
         self.t_elapsed = 0
-        self.t_last_update = 0
+        self.t_last_log = 0
 
     def update(self, n=1):
         t_now = time.time()
-        delta_t = self.t_last_update - t_now
+        delta_t = t_now - self.t_last_update
         self.t_last_update = t_now
 
         self.t_elapsed += delta_t
         self.n_done += n
 
-        if t_now > self.t_last_update + self.log_interval:
-            rate = self.t_elapsed / self.n_done
+        if t_now > self.t_last_log + self.log_interval:
+            self.t_last_log = t_now
+            rate = self.n_done / self.t_elapsed
 
             if self.description is not None:
                 msg = f"{self.description}: "
@@ -92,7 +93,7 @@ class ProgressLogger:
 
                 parts.append(f"{format_interval(self.t_elapsed)}")
 
-            if rate >= 0:
+            if (rate >= 1) or (rate <= 0):
                 parts.append(f"{format_number(rate, self.number_format)}{self.unit}/s")
             else:
                 parts.append(f"{1/rate:.2f}s/{self.unit}")
@@ -123,13 +124,15 @@ class LogProgress(Node):
                 log_interval=self.log_interval, number_format=self.number_format
             )
 
-            for n_consumed, obj in enumerate(stream, 1):
+            for n_processed, obj in enumerate(stream):
                 description = self.prepare_input(obj, "description")
 
                 if description is not None:
                     progress_logger.description = str(description)
 
                 if obj.n_remaining_hint is not None:
-                    progress_logger.n_total = n_consumed + obj.n_remaining_hint
+                    progress_logger.n_total = n_processed + obj.n_remaining_hint
+
+                progress_logger.update()
 
                 yield obj

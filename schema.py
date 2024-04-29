@@ -121,8 +121,12 @@ class MergeAnnotationsSchema(DefaultSchema):
     min_validated_overlap = fields.Float(required=False)
 
 
+class ScalebarSchema(Schema):
+    px_per_mm = fields.Float(required=True)
+
+
 class PostprocessingSchema(Schema):
-    scalebar = fields.Bool(load_default=False)
+    scalebar = fields.Nested(ScalebarSchema, load_default=None)
 
     # Process only this many objects
     slice = fields.Int(load_default=None)

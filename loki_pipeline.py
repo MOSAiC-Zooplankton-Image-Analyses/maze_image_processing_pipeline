@@ -45,6 +45,7 @@ from morphocut.core import (
     RawOrVariable,
     ReturnOutputs,
     Stream,
+    StreamObject,
     Variable,
     closing_if_closable,
 )
@@ -66,14 +67,14 @@ logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
 if sys.stdout.isatty():
-    Progress = (LiveProgress,)
+    Progress = LiveProgress
 else:
     from functools import partial
 
     from log_progress import LogProgress
 
-    # Set log_interval to 10min
-    Progress = partial(LogProgress, log_interval=600)
+    # Set log_interval to 3min
+    Progress = partial(LogProgress, log_interval=3 * 60)
 
 
 class FilterEval(Node):
@@ -313,11 +314,9 @@ def update_and_validate_sample_meta(data_root: PurePathBase, meta: Dict):
     meta["sample_id"] = "{sample_station}_{sample_haul}".format_map(meta)
     meta["acq_id"] = "{acq_instrument}_{sample_id}".format_map(meta)
 
+    # These are per sample_id
     meta["process_datetime"] = datetime.datetime.now().isoformat(timespec="seconds")
     meta["process_id"] = "{acq_id}_{process_datetime}".format_map(meta)
-    meta["process_morphocut_version"] = morphocut.__version__
-    meta["process_loki_pipeline_version"] = _version.get_versions()["version"]
-    # TODO: More process metadata
 
     return meta
 
@@ -455,7 +454,9 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
     return foreground_pred, labels
 
 
-def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], meta):
+def build_pytorch_segmentation(
+    config: Mapping, image: Variable[np.ndarray], meta, process_meta: Dict
+):
     import torch
     import torch.jit
 
@@ -485,6 +486,8 @@ def build_pytorch_segmentation(config: Mapping, image: Variable[np.ndarray], met
         if config["stitch"]["skip_single"]:
             keep = Call(lambda image: image.n_regions > 1, image)
             Filter(keep)
+    else:
+        process_meta["process_segmentation_pytorch_stitch"] = False
 
     # Deep Learning Segmentation
     device = config["device"]
@@ -657,7 +660,9 @@ def build_threshold_segmentation(config, image, meta):
     return image, meta
 
 
-def build_segmentation(config, image, meta) -> Tuple[Variable, Variable, RawOrVariable]:
+def build_segmentation(
+    config, image, meta, process_meta: Dict
+) -> Tuple[Variable, Variable, RawOrVariable]:
     mask = None
 
     if config is None:
@@ -671,7 +676,9 @@ def build_segmentation(config, image, meta) -> Tuple[Variable, Variable, RawOrVa
     elif segmentation_type == "threshold":
         image, meta = build_threshold_segmentation(segmentation_config, image, meta)
     elif segmentation_type == "pytorch":
-        image, meta, mask = build_pytorch_segmentation(segmentation_config, image, meta)
+        image, meta, mask = build_pytorch_segmentation(
+            segmentation_config, image, meta, process_meta
+        )
     else:
         raise ValueError(f"Unknown segmentation config: {config}")
 
@@ -771,11 +778,13 @@ def _find_files_glob(pattern: str, ignore_patterns: Collection | None = None):
         yield fn
 
 
-def build_input(input_config: Mapping, output_config: Mapping):
-    meta = input_config.get("meta", {})
-
-    # Set defaults
-    meta.setdefault("acq_instrument", "LOKI")
+def build_input(
+    input_config: Mapping, output_config: Mapping, meta: Variable, process_meta: Dict
+):
+    # Insert input_meta into meta
+    input_meta = input_config.get("meta", {})
+    input_meta.setdefault("acq_instrument", "LOKI")
+    meta = Call(lambda meta, input_meta: {**meta, **input_meta}, meta, input_meta)
 
     data_roots: List[PathBase]
     if "discover" in input_config:
@@ -804,8 +813,6 @@ def build_input(input_config: Mapping, output_config: Mapping):
     with AggregateErrorsPipeline():
         # Generate additional metadata and validate
         meta = Call(update_and_validate_sample_meta, data_root, meta)
-
-        # TODO: Drop ignored `data_root`s
 
         if input_config["merge_telemetry"] is not None:
             telemetry_config = input_config["merge_telemetry"]
@@ -923,10 +930,13 @@ def build_input(input_config: Mapping, output_config: Mapping):
     # Filter based on expression
     if input_config["filter_expr"] is not None:
         logger.info(f"Filtering input by expression {input_config['filter_expr']!r}")
+        process_meta["process_input_filter"] = input_config["filter_expr"]
         FilterEval(input_config["filter_expr"], meta)
 
     # Detect duplicates
-    build_duplicate_detection(input_config["detect_duplicates"], image, meta, "input")
+    build_duplicate_detection(
+        input_config["detect_duplicates"], image, meta, "input", process_meta
+    )
 
     if input_config["save_meta"]:
         # Write input metadata
@@ -940,7 +950,7 @@ def build_input(input_config: Mapping, output_config: Mapping):
 
 
 def build_duplicate_detection(
-    detect_duplicates_config: Optional[Mapping], image, meta, where: str
+    detect_duplicates_config: Optional[Mapping], image, meta, where: str, process_meta
 ):
     if detect_duplicates_config is None:
         return
@@ -1067,14 +1077,27 @@ def build_and_run_pipeline(pipeline_config: Mapping):
     """
 
     with Pipeline() as p:
+        process_meta_var = Variable("process_meta", None)
+        process_meta = {}
+
+        process_meta["process_morphocut_version"] = morphocut.__version__
+        process_meta["process_loki_pipeline_version"] = _version.get_versions()[
+            "version"
+        ]
+        process_meta["process_skimage_version"] = skimage.__version__
+        # TODO: More process metadata
+
         image, meta, target_archive_fn = build_input(
-            pipeline_config["input"], pipeline_config["output"]
+            pipeline_config["input"],
+            pipeline_config["output"],
+            process_meta_var,
+            process_meta,
         )
 
         Progress("Input objects")
 
         image, meta, mask = build_segmentation(
-            pipeline_config["segmentation"], image, meta
+            pipeline_config["segmentation"], image, meta, process_meta
         )
 
         StreamBuffer(8)
@@ -1083,25 +1106,34 @@ def build_and_run_pipeline(pipeline_config: Mapping):
         postprocess_config = pipeline_config["postprocess"]
 
         build_duplicate_detection(
-            postprocess_config["detect_duplicates"], image, meta, "output"
+            postprocess_config["detect_duplicates"],
+            image,
+            meta,
+            "output",
+            process_meta,
         )
 
         if postprocess_config["filter_invalid"]:
             raise NotImplementedError()
             # build_invalid_detection(pipeline_config["output"]["detect_invalid"], image, mask)
 
+        process_meta["process_rescale_max_intensity"] = postprocess_config[
+            "rescale_max_intensity"
+        ]
         if postprocess_config["rescale_max_intensity"]:
             logger.info(f"Rescaling intensity of output images")
             # Image enhancement: Stretch contrast
             image = Call(rescale_max_intensity, image)
 
-        if postprocess_config["scalebar"]:
-            # TODO: Write scale bar info to processing details
+        if postprocess_config["scalebar"] is not None:
+            scalebar_config = postprocess_config["scalebar"]
+            process_meta["process_scalebar_px_per_mm"] = scalebar_config["px_per_mm"]
+
             logger.info("Drawing scalebar")
             image = DrawScalebar(
                 image,
                 length_in_unit=1,
-                px_per_unit=103,
+                px_per_unit=scalebar_config["px_per_mm"],
                 unit="mm",
                 fg_color=255,
                 bg_color=0,
@@ -1127,6 +1159,7 @@ def build_and_run_pipeline(pipeline_config: Mapping):
             logger.info(
                 f"Filtering output by expression {output_config['filter_expr']!r}"
             )
+
             FilterEval(output_config["filter_expr"], meta)
 
         target_image_fn = Call(output_config["image_fn"].format_map, meta)
@@ -1149,7 +1182,10 @@ def build_and_run_pipeline(pipeline_config: Mapping):
             UserWarning,
         )
 
-        p.run()
+        # Inject pipeline metadata into the stream
+        obj = StreamObject(n_remaining_hint=1)
+        obj[process_meta_var] = process_meta
+        p.run(iter([obj]))
 
 
 def filename_suffix(fn: str, suffix: str):
