@@ -6,13 +6,13 @@ import itertools
 import logging
 import os
 import pathlib
+import sys
 import warnings
 from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+import _version
 import exceptiongroup
 import natsort as ns
-
-import _version
 import numpy as np
 import pandas as pd
 import parse
@@ -56,12 +56,24 @@ from morphocut.pipelines import (
 )
 from morphocut.scalebar import DrawScalebar
 from morphocut.stitch import Stitch
-from morphocut.stream import Filter, Progress, Slice, StreamBuffer, Unpack
+from morphocut.stream import Filter
+from morphocut.stream import Progress as LiveProgress
+from morphocut.stream import Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
+
+if sys.stdout.isatty():
+    Progress = (LiveProgress,)
+else:
+    from functools import partial
+
+    from log_progress import LogProgress
+
+    # Set log_interval to 10min
+    Progress = partial(LogProgress, log_interval=600)
 
 
 class FilterEval(Node):
