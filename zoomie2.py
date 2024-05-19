@@ -374,12 +374,10 @@ class _DuplicateMatcherSimple:
         *,
         score_fn,
         min_similarity,
-        verbose,
         max_age,
     ) -> None:
         self.score_fn = score_fn
         self.min_similarity = min_similarity
-        self.verbose = verbose
         self.max_age = max_age
 
         self._prev_objects = []
@@ -456,7 +454,6 @@ class DetectDuplicatesSimple(Node):
         score_arg: RawOrVariable[T] = None,
         min_similarity=0.95,
         max_age=1,
-        verbose=False,
     ):
         super().__init__()
 
@@ -465,14 +462,12 @@ class DetectDuplicatesSimple(Node):
         self.score_fn = score_fn
         self.score_arg = score_arg
         self.min_similarity = min_similarity
-        self.verbose = verbose
         self.max_age = max_age
 
     def transform_stream(self, stream: Stream) -> Stream:
         duplicate_matcher = _DuplicateMatcherSimple(
             score_fn=self.score_fn,
             min_similarity=self.min_similarity,
-            verbose=self.verbose,
             max_age=self.max_age,
         )
 

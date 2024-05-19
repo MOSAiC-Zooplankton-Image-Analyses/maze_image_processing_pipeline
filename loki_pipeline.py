@@ -8,7 +8,20 @@ import os
 import pathlib
 import sys
 import warnings
-from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Collection,
+    Dict,
+    Iterator,
+    Literal,
+    Mapping,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+import click
+from morphocut.utils import StreamEstimator
+import pydantic
 
 import _version
 import exceptiongroup
@@ -63,6 +76,17 @@ from morphocut.stream import Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 
+from config_schema import (
+    DetectDuplicatesModelOrFalse,
+    EcoTaxaOutputConfig,
+    LokiInputConfig,
+    PytorchSegmentationConfig,
+    SegmentationConfig,
+    SegmentationPipelineConfig,
+    SegmentationPostprocessingConfig,
+    ThresholdSegmentationConfig,
+)
+
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
@@ -91,14 +115,19 @@ class FilterEval(Node):
 
     def transform_stream(self, stream: Stream) -> Stream:
         with closing_if_closable(stream):
+            stream_estimator = StreamEstimator()
             for obj in stream:
-                try:
-                    data: Mapping = self.prepare_input(obj, "data")  # type: ignore
+                with stream_estimator.consume(obj.n_remaining_hint) as incoming:
+                    try:
+                        data: Mapping = self.prepare_input(obj, "data")  # type: ignore
 
-                    if eval(self._compiled_expr, None, data):
-                        yield obj
-                except Exception as exc:
-                    raise type(exc)(*exc.args, f"{self}")
+                        if not eval(self._compiled_expr, None, data):
+                            continue
+                    except Exception as exc:
+                        raise type(exc)(*exc.args, f"{self}")
+
+                    obj.n_remaining_hint = incoming.emit()
+                    yield obj
 
 
 def read_log_and_yaml_meta(data_root: PathBase, meta: Mapping):
@@ -390,33 +419,35 @@ def convert_img_dtype(image, dtype: np.dtype):
     raise ValueError(f"Can not convert {image.dtype} to {dtype}.")
 
 
-def build_segmentation_postprocessing(config: Mapping, foreground_pred):
+def build_segmentation_postprocessing(
+    config: SegmentationPostprocessingConfig, foreground_pred
+):
     with contextlib.ExitStack() as exit_stack:
-        if config["n_threads"] > 1:
+        if config.n_threads > 1:
             # Post-processing task is CPU-bound
-            exit_stack.enter_context(DataParallelPipeline(executor=config["n_threads"]))
+            exit_stack.enter_context(DataParallelPipeline(executor=config.n_threads))
 
         # Convert to bool
         foreground_pred = Call(np.asarray, foreground_pred, dtype=bool)
 
         # Opening (remove small details)
-        if config["opening_radius"] > 0:
+        if config.opening_radius > 0:
             foreground_pred = Call(
                 skimage.morphology.binary_opening,
                 foreground_pred,
                 skimage.morphology.disk(
-                    config["opening_radius"],
+                    config.opening_radius,
                     decomposition="crosses",
                 ),
             )
 
         # Closing (close small gaps)
-        if config["closing_radius"] > 0:
+        if config.closing_radius > 0:
             foreground_pred = Call(
                 skimage.morphology.binary_closing,
                 foreground_pred,
                 skimage.morphology.disk(
-                    config["closing_radius"],
+                    config.closing_radius,
                     decomposition="crosses",
                 ),
             )
@@ -427,27 +458,27 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
             foreground_pred,
         )
 
-        if config["clear_border"]:
+        if config.clear_border:
             Call(
                 lambda labels: skimage.segmentation.clear_border(labels, out=labels),
                 labels,
             )
 
         # Remove objects below area threshold
-        if config["min_area"] > 0:
+        if config.min_area > 0:
             labels = Call(
                 skimage.morphology.remove_small_objects,
                 labels,
-                min_size=config["min_area"],
+                min_size=config.min_area,
                 out=labels,
             )
 
         # Merge neighboring labels
-        if config["merge_labels"] > 0:
+        if config.merge_segments_distance > 0:
             labels = Call(
                 merge_labels,
                 labels,
-                max_distance=config["merge_labels"],
+                max_distance=config.merge_segments_distance,
                 labels_out=labels,
             )
 
@@ -455,24 +486,16 @@ def build_segmentation_postprocessing(config: Mapping, foreground_pred):
 
 
 def build_pytorch_segmentation(
-    config: Mapping, image: Variable[np.ndarray], meta, process_meta: Dict
+    config: PytorchSegmentationConfig,
+    target_dir,
+    image: Variable[np.ndarray],
+    meta,
+    process_meta: Dict,
 ):
     import torch
     import torch.jit
 
-    # # Construct image AnchoredArray (with slices meta-information)
-    # image = Call(
-    #     lambda image, x, y: AnchoredArray.create(image, offsets=(y, x)),
-    #     image,
-    #     meta["object_posx"],
-    #     meta["object_posy"],
-    # )
-    # if config["cluster_stitch"]:
-    #     # Buffer to have enough ROIs immediately available for stitching
-    #     StreamBuffer(16)
-    #     region = ClusterStitch(region, groupby=meta["object_frame_id"], margin=75)
-
-    if config["stitch"] is not None and config["stitch"]:
+    if config.stitch:
         # Buffer to have enough ROIs immediately available for stitching
         StreamBuffer(16)
 
@@ -483,22 +506,17 @@ def build_pytorch_segmentation(
             offset=(meta["object_posy"], meta["object_posx"]),
         )
 
-        if config["stitch"]["skip_single"]:
+        if config.stitch.skip_single:
             keep = Call(lambda image: image.n_regions > 1, image)
             Filter(keep)
     else:
         process_meta["process_segmentation_pytorch_stitch"] = False
 
     # Deep Learning Segmentation
-    device = config["device"]
-    dtype = config["dtype"]
+    device = config.device
+    dtype = config.dtype
 
-    if config.get("model_fn"):
-        model = torch.load(config.get("model_fn"), map_location=device)
-    elif config.get("jit_model_fn"):
-        model = torch.jit.load(config.get("jit_model_fn"), map_location=device)
-    else:
-        raise ValueError("No model fn")
+    model = torch.jit.load(config.model_fn, map_location=device)
 
     assert isinstance(model, torch.nn.Module), "Model is not a torch.nn.Module"
 
@@ -526,12 +544,12 @@ def build_pytorch_segmentation(
         Filter(Call(lambda image: (image > 0).any(), image))
 
         with contextlib.ExitStack() as exit_stack:
-            if config["batch_size"]:
-                exit_stack.enter_context(BatchedPipeline(config["batch_size"]))
+            if config.batch_size:
+                exit_stack.enter_context(BatchedPipeline(config.batch_size))
 
-            if config["n_threads"] > 1:
+            if config.n_threads > 1:
                 exit_stack.enter_context(
-                    DataParallelPipeline(executor=config["n_threads"])
+                    DataParallelPipeline(executor=config.n_threads)
                 )
 
             foreground_pred = PyTorch(
@@ -541,7 +559,7 @@ def build_pytorch_segmentation(
                 output_key=0,
                 pre_transform=pre_transform,
                 pin_memory=device.startswith("cuda"),
-                autocast=config["autocast"],
+                autocast=config.autocast,
             )
 
             # # Dummy for speed optimization
@@ -551,12 +569,13 @@ def build_pytorch_segmentation(
             # )
 
     # Postprocessing
-    foreground_pred, labels = build_segmentation_postprocessing(
-        config["postprocess"], foreground_pred
-    )
+    if config.postprocess:
+        foreground_pred, labels = build_segmentation_postprocessing(
+            config.postprocess, foreground_pred
+        )
 
     # DEBUG: Store segmentation output
-    if config["full_frame_archive_fn"] is not None:
+    if config.full_frame_archive_fn is not None:
         Call(assert_compatible_shape, labels, image)
         segment_image = Call(
             lambda labels, image: skimage.util.img_as_ubyte(
@@ -572,7 +591,10 @@ def build_pytorch_segmentation(
         )
 
         full_frame_archive_fn = Call(
-            str.format_map, config["full_frame_archive_fn"], meta
+            lambda meta: os.path.join(
+                target_dir, config.full_frame_archive_fn.format_map(meta)
+            ),
+            meta,
         )
 
         #  Store stitched result
@@ -593,16 +615,16 @@ def build_pytorch_segmentation(
     region = FindRegions(
         labels,
         image,
-        padding=config["padding"],
-        min_intensity=config["min_intensity"],
+        padding=config.padding,
+        min_intensity=config.min_intensity,
     )
 
     image = ExtractROI(
         image,
         region,
-        alpha=1 if config["apply_mask"] else 0,
-        bg_color=config["background_color"],
-        keep_background=config["keep_background"],
+        alpha=1 if config.apply_mask else 0,
+        bg_color=config.background_color,
+        keep_background=config.keep_background,
     )
 
     def recalc_metadata(region: RegionProperties, meta):
@@ -649,8 +671,8 @@ def one_of(
     raise ValueError(f"Multiple matches for {keys} in {config}")
 
 
-def build_threshold_segmentation(config, image, meta):
-    mask = image > config["threshold"]
+def build_threshold_segmentation(config: ThresholdSegmentationConfig, image, meta):
+    mask = image > config.threshold
 
     Filter(lambda obj: obj[mask].any())
 
@@ -661,32 +683,27 @@ def build_threshold_segmentation(config, image, meta):
 
 
 def build_segmentation(
-    config, image, meta, process_meta: Dict
+    config: SegmentationConfig, target_dir: str, image, meta, process_meta: Dict
 ) -> Tuple[Variable, Variable, RawOrVariable]:
     mask = None
 
     if config is None:
         return image, meta, mask
 
-    segmentation_type, segmentation_config = one_of(
-        config, ["threshold", "stored", "pytorch"]
-    )
-    if segmentation_type is None:
-        raise ValueError(f"No segmentation type specified")
-    elif segmentation_type == "threshold":
-        image, meta = build_threshold_segmentation(segmentation_config, image, meta)
-    elif segmentation_type == "pytorch":
+    if config.threshold is not None:
+        image, meta = build_threshold_segmentation(config.threshold, image, meta)
+    elif config.pytorch is not None:
         image, meta, mask = build_pytorch_segmentation(
-            segmentation_config, image, meta, process_meta
+            config.pytorch, target_dir, image, meta, process_meta
         )
     else:
         raise ValueError(f"Unknown segmentation config: {config}")
 
-    if config["filter_expr"] is not None:
+    if config.filter_expr is not None:
         logger.info(
-            f"Filtering segmentation results by expression {config['filter_expr']!r}"
+            f"Filtering segmentation results by expression {config.filter_expr!r}"
         )
-        FilterEval(config["filter_expr"], meta)
+        FilterEval(config.filter_expr, meta)
 
     return image, meta, mask
 
@@ -753,15 +770,15 @@ def score_fn_simple(meta0, meta1):
 
 
 def build_object_frame_id_filter(
-    filter_object_frame_id_fn: str | None, meta: Variable[Mapping]
+    valid_frame_id_fn: str | None, meta: Variable[Mapping]
 ):
-    if filter_object_frame_id_fn is None:
+    if valid_frame_id_fn is None:
         return
 
-    logger.info(f"Filtering object_frame_id from {filter_object_frame_id_fn}...")
+    logger.info(f"Filtering object_frame_id from {valid_frame_id_fn}...")
 
     index = pd.Index(
-        pd.read_csv(filter_object_frame_id_fn, header=None, index_col=False).squeeze()
+        pd.read_csv(valid_frame_id_fn, header=None, index_col=False).squeeze()
     )
 
     Filter(lambda obj: obj[meta]["object_frame_id"] in index)
@@ -779,48 +796,57 @@ def _find_files_glob(pattern: str, ignore_patterns: Collection | None = None):
 
 
 def build_input(
-    input_config: Mapping, output_config: Mapping, meta: Variable, process_meta: Dict
+    input_config: LokiInputConfig,
+    output_config: EcoTaxaOutputConfig,
+    meta: Variable,
+    process_meta: Dict,
 ):
     # Insert input_meta into meta
-    input_meta = input_config.get("meta", {})
-    input_meta.setdefault("acq_instrument", "LOKI")
-    meta = Call(lambda meta, input_meta: {**meta, **input_meta}, meta, input_meta)
+    default_meta = input_config.default_meta
+    default_meta.setdefault("acq_instrument", "LOKI")
+    meta = Call(lambda meta, default_meta: {**meta, **default_meta}, meta, default_meta)
 
-    data_roots: List[PathBase]
-    if "discover" in input_config:
-        # List directories that contain "Pictures" and "Telemetrie" folders
-        data_roots = list(
-            lokidata.find_data_roots(
-                input_config["path"], input_config.get("ignore_patterns", None)
-            )
-        )
-    elif "glob" in input_config:
-        glob_config = input_config["glob"]
-        data_roots = [Archive(fn) for fn in _find_files_glob(glob_config["pattern"], glob_config["ignore_patterns"])]  # type: ignore
-    else:
-        raise ValueError("Specify one of 'discover' or 'glob' in 'input'")
+    # Discover samples
+    _sample_roots: Iterator[str] = _find_files_glob(
+        input_config.path, input_config.ignore_patterns
+    )
 
-    logger.info(f"Found {len(data_roots):d} input directories")
+    if input_config.discover:
 
-    data_root = Unpack(ns.natsorted(data_roots, alg=ns.PATH | ns.IGNORECASE))
+        def _find_sample_roots(sample_roots):
+            for sample_root in sample_roots:
+                yield from lokidata.find_data_roots(
+                    input_config.path, input_config.ignore_patterns
+                )
 
-    Progress(data_root)
+        _sample_roots = _find_sample_roots(_sample_roots)
+
+    sample_roots = [Archive(fn) for fn in _sample_roots]
+
+    logger.info(f"Found {len(sample_roots):d} input directories")
+
+    sample_root = Unpack(ns.natsorted(sample_roots, alg=ns.PATH | ns.IGNORECASE))
+
+    Progress(sample_root)
 
     # Load LOG metadata
-    meta = Call(read_log_and_yaml_meta, data_root, meta)
+    meta = Call(read_log_and_yaml_meta, sample_root, meta)
 
     # Preload all metadata (to avoid later validation errores)
     with AggregateErrorsPipeline():
         # Generate additional metadata and validate
-        meta = Call(update_and_validate_sample_meta, data_root, meta)
+        meta = Call(update_and_validate_sample_meta, sample_root, meta)
 
-        if input_config["merge_telemetry"] is not None:
-            telemetry_config = input_config["merge_telemetry"]
+        if input_config.merge_telemetry is not None:
+            telemetry_config = input_config.merge_telemetry
             logger.info(f"Merging telemetry: {telemetry_config}")
 
             # Load *all* telemetry data
             telemetry = Call(
-                Telemetry, data_root, ignore_errors=True, **telemetry_config
+                Telemetry,
+                sample_root,
+                ignore_errors=True,
+                **telemetry_config.model_dump(),
             )
         else:
             telemetry = None
@@ -830,20 +856,20 @@ def build_input(
             lambda data_root: (
                 data_root.close() if hasattr(data_root, "close") else None
             ),
-            data_root,
+            sample_root,
         )
 
-    os.makedirs(output_config["path"], exist_ok=True)
+    os.makedirs(output_config.target_dir, exist_ok=True)
 
     target_archive_fn = Call(
         lambda meta: os.path.join(
-            output_config["path"],
+            output_config.target_dir,
             "LOKI_{sample_station}_{sample_haul}.zip".format_map(meta),
         ),
         meta,
     )
 
-    if output_config["skip_existing"]:
+    if output_config.skip_existing:
 
         def check_not_exists(target_archive_fn):
             if not os.path.exists(target_archive_fn):
@@ -854,10 +880,10 @@ def build_input(
 
         Filter(Call(check_not_exists, target_archive_fn))
 
-    if input_config["save_meta"]:
+    if input_config.save_meta:
         input_meta_archive_fn = Call(
             lambda meta: os.path.join(
-                output_config["path"],
+                output_config.target_dir,
                 "LOKI_{sample_station}_{sample_haul}_input_meta.zip".format_map(meta),
             ),
             meta,
@@ -875,7 +901,7 @@ def build_input(
             for path in (data_root / "Pictures").glob("*/*.*")
             if path.suffix in [".jpg", ".bmp", ".png"]
         ),
-        data_root,
+        sample_root,
     )
 
     Call(
@@ -883,7 +909,7 @@ def build_input(
             f"{len(picture_fns)} input images in {data_root}."
         ),
         picture_fns,
-        data_root,
+        sample_root,
     )
 
     picture_fn = Unpack(picture_fns)
@@ -898,14 +924,12 @@ def build_input(
     meta = Call(parse_object_id, object_id, meta)
 
     # Skip frames where no annotated objects exist (if configured)
-    build_object_frame_id_filter(input_config["filter_object_frame_id"], meta)
+    build_object_frame_id_filter(input_config.valid_frame_id_fn, meta)
 
     # DEBUG: Slice
-    if input_config["slice"] is not None:
-        logger.warning(
-            f"Only processing the first {input_config['slice']} input objects."
-        )
-        Slice(input_config["slice"])
+    if input_config.slice is not None:
+        logger.warning(f"Only processing the first {input_config.slice} input objects.")
+        Slice(input_config.slice)
 
     def error_handler(exc, img_fn):
         exceptiongroup.print_exc(file=sys.stderr)
@@ -928,17 +952,17 @@ def build_input(
     )
 
     # Filter based on expression
-    if input_config["filter_expr"] is not None:
-        logger.info(f"Filtering input by expression {input_config['filter_expr']!r}")
-        process_meta["process_input_filter"] = input_config["filter_expr"]
-        FilterEval(input_config["filter_expr"], meta)
+    if input_config.filter_expr is not None:
+        logger.info(f"Filtering input by expression {input_config.filter_expr!r}")
+        process_meta["process_input_filter"] = input_config.filter_expr
+        FilterEval(input_config.filter_expr, meta)
 
     # Detect duplicates
     build_duplicate_detection(
-        input_config["detect_duplicates"], image, meta, "input", process_meta
+        input_config.detect_duplicates, image, meta, "input", process_meta
     )
 
-    if input_config["save_meta"]:
+    if input_config.save_meta:
         # Write input metadata
         EcotaxaWriter(input_meta_archive_fn, [], meta)
 
@@ -950,7 +974,11 @@ def build_input(
 
 
 def build_duplicate_detection(
-    detect_duplicates_config: Optional[Mapping], image, meta, where: str, process_meta
+    detect_duplicates_config: DetectDuplicatesModelOrFalse,
+    image,
+    meta,
+    where: str,
+    process_meta,
 ):
     if detect_duplicates_config is None:
         return
@@ -965,9 +993,8 @@ def build_duplicate_detection(
         meta["object_id"],
         score_fn=score_fn_simple,
         score_arg=meta,
-        min_similarity=detect_duplicates_config["min_similarity"],
-        max_age=detect_duplicates_config["max_age"],
-        verbose=detect_duplicates_config["verbose"],
+        min_similarity=detect_duplicates_config.min_similarity,
+        max_age=detect_duplicates_config.max_age,
     )
 
     # Only keep the first object of each duplicate set
@@ -1001,15 +1028,16 @@ class MergeAnnotations(Node):
 
         annotations = read_tsv(annotations_fn)
 
-        missing_fields = {
+        missing_columns = {
             "object_width",
             "object_height",
             "object_posx",
             "object_posy",
+            "object_frame_id",
         } - set(annotations.columns)
-        if missing_fields:
+        if missing_columns:
             raise ValueError(
-                f"The following fields are missing: {sorted(missing_fields)}"
+                f"The following columns are missing: {sorted(missing_columns)}"
             )
 
         self._annotations_by_frame_id = annotations.groupby("object_frame_id")
@@ -1067,7 +1095,7 @@ class MergeAnnotations(Node):
         return meta
 
 
-def build_and_run_pipeline(pipeline_config: Mapping):
+def build_and_run_pipeline(pipeline_config: SegmentationPipelineConfig):
     """
     Args:
         input_path (str): Path to LOKI data (directory containing "Pictures" and "Telemetrie").
@@ -1088,8 +1116,8 @@ def build_and_run_pipeline(pipeline_config: Mapping):
         # TODO: More process metadata
 
         image, meta, target_archive_fn = build_input(
-            pipeline_config["input"],
-            pipeline_config["output"],
+            pipeline_config.input,
+            pipeline_config.output,
             process_meta_var,
             process_meta,
         )
@@ -1097,74 +1125,73 @@ def build_and_run_pipeline(pipeline_config: Mapping):
         Progress("Input objects")
 
         image, meta, mask = build_segmentation(
-            pipeline_config["segmentation"], image, meta, process_meta
+            pipeline_config.segmentation,
+            pipeline_config.output.target_dir,
+            image,
+            meta,
+            process_meta,
         )
 
         StreamBuffer(8)
 
         # Post-Processing
-        postprocess_config = pipeline_config["postprocess"]
+        postprocess_config = pipeline_config.postprocess
 
         build_duplicate_detection(
-            postprocess_config["detect_duplicates"],
+            postprocess_config.detect_duplicates,
             image,
             meta,
             "output",
             process_meta,
         )
 
-        if postprocess_config["filter_invalid"]:
-            raise NotImplementedError()
-            # build_invalid_detection(pipeline_config["output"]["detect_invalid"], image, mask)
+        process_meta["process_rescale_max_intensity"] = (
+            postprocess_config.rescale_max_intensity
+        )
 
-        process_meta["process_rescale_max_intensity"] = postprocess_config[
-            "rescale_max_intensity"
-        ]
-        if postprocess_config["rescale_max_intensity"]:
+        if postprocess_config.rescale_max_intensity:
             logger.info(f"Rescaling intensity of output images")
             # Image enhancement: Stretch contrast
             image = Call(rescale_max_intensity, image)
 
-        if postprocess_config["scalebar"] is not None:
-            scalebar_config = postprocess_config["scalebar"]
-            process_meta["process_scalebar_px_per_mm"] = scalebar_config["px_per_mm"]
+        if postprocess_config.scalebar is not None:
+            scalebar_config = postprocess_config.scalebar
+            process_meta["process_scalebar_px_per_mm"] = scalebar_config.px_per_mm
 
             logger.info("Drawing scalebar")
             image = DrawScalebar(
                 image,
                 length_in_unit=1,
-                px_per_unit=scalebar_config["px_per_mm"],
+                px_per_unit=scalebar_config.px_per_mm,
                 unit="mm",
                 fg_color=255,
                 bg_color=0,
             )
 
-        if postprocess_config["merge_annotations"] is not None:
-            logger.info(
-                f"Merging annotations: {postprocess_config['merge_annotations']}"
+        if postprocess_config.merge_annotations is not None:
+            logger.info(f"Merging annotations: {postprocess_config.merge_annotations}")
+            meta = MergeAnnotations(
+                meta, **postprocess_config.merge_annotations.model_dump()
             )
-            meta = MergeAnnotations(meta, **postprocess_config["merge_annotations"])
 
         # DEBUG: Slice
-        if postprocess_config["slice"] is not None:
+        if postprocess_config.slice is not None:
             logger.warning(
-                f"Only processing the first {postprocess_config['slice']} output objects."
+                f"Only processing the first {postprocess_config.slice} output objects."
             )
-            Slice(postprocess_config["slice"])
+            Slice(postprocess_config.slice)
+
+        if postprocess_config.filter_expr is not None:
+            logger.info(f"Filtering output by expression {output_config.filter_expr!r}")
+
+            FilterEval(output_config.filter_expr, meta)
 
         ## Output
-        output_config = pipeline_config["output"]
+        output_config = pipeline_config.output
 
-        if output_config["filter_expr"] is not None:
-            logger.info(
-                f"Filtering output by expression {output_config['filter_expr']!r}"
-            )
-
-            FilterEval(output_config["filter_expr"], meta)
-
-        target_image_fn = Call(output_config["image_fn"].format_map, meta)
+        target_image_fn = Call(output_config.image_fn.format_map, meta)
         output_images = [(target_image_fn, image)]
-        if output_config["store_mask"]:
+        if output_config.store_mask:
             target_mask_fn = Call(filename_suffix, target_image_fn, "_mask")
             output_images.append((target_mask_fn, mask))
 
@@ -1172,7 +1199,7 @@ def build_and_run_pipeline(pipeline_config: Mapping):
             target_archive_fn,
             output_images,
             meta,
-            store_types=output_config["type_header"],
+            store_types=output_config.type_header,
         )
 
     with warnings.catch_warnings():
@@ -1193,16 +1220,19 @@ def filename_suffix(fn: str, suffix: str):
     return stem + suffix + ext
 
 
-if __name__ == "__main__":
+@click.command()
+@click.argument("task_fn", type=click.Path(exists=True))
+def main(task_fn):
     import sys
 
     from rich.logging import RichHandler
-    from schema import PipelineSchema
 
-    if len(sys.argv) != 2:
-        print("You need to supply a task file", file=sys.stderr)
-
-    task_fn = sys.argv[1]
+    # Setup logging
+    root_logger = logging.getLogger()
+    stream_handler = RichHandler(highlighter=NullHighlighter())
+    stream_handler.setLevel(logging.DEBUG)
+    root_logger.addHandler(stream_handler)
+    root_logger.setLevel(logging.INFO)
 
     sys.path.insert(0, os.path.realpath(os.curdir))
 
@@ -1211,22 +1241,13 @@ if __name__ == "__main__":
     task_name = os.path.splitext(os.path.basename(task_fn))[0]
     task_fn_modified = datetime.datetime.fromtimestamp(os.stat(task_fn).st_mtime)
 
-    # Setup logging
     log_fn = os.path.abspath(
         f'{task_name}-{datetime.datetime.now().isoformat(timespec="seconds")}.log'
     )
     print(f"Logging to {log_fn}.")
     file_handler = logging.FileHandler(log_fn)
     file_handler.setLevel(logging.DEBUG)
-
-    stream_handler = RichHandler(highlighter=NullHighlighter())
-    stream_handler.setLevel(logging.DEBUG)
-
-    root_logger = logging.getLogger()
-
     root_logger.addHandler(file_handler)
-    root_logger.addHandler(stream_handler)
-    root_logger.setLevel(logging.INFO)
 
     # Also capture exceptions
 
@@ -1254,5 +1275,15 @@ if __name__ == "__main__":
     root_logger.info(f"Log levels: {log_levels}")
 
     with open(task_fn) as f:
-        config = PipelineSchema().load(yaml.safe_load(f))
-        p = build_and_run_pipeline(config)  # type: ignore
+        try:
+            segmentation_pipeline_cfg = SegmentationPipelineConfig.model_validate(
+                yaml.safe_load(f)
+            )
+        except pydantic.ValidationError as exc:
+            logger.error(str(exc))
+        else:
+            build_and_run_pipeline(segmentation_pipeline_cfg)  # type: ignore
+
+
+if __name__ == "__main__":
+    main()
