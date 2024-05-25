@@ -672,7 +672,7 @@ def one_of(
 
 
 def build_threshold_segmentation(config: ThresholdSegmentationConfig, image, meta):
-    mask = image > config.threshold
+    mask = image > config.threshold_brighter
 
     Filter(lambda obj: obj[mask].any())
 
@@ -1105,7 +1105,7 @@ def build_and_run_pipeline(pipeline_config: SegmentationPipelineConfig):
     """
 
     with Pipeline() as p:
-        process_meta_var = Variable("process_meta", None)
+        process_meta_var = Variable("process_meta", p)
         process_meta = {}
 
         process_meta["process_morphocut_version"] = morphocut.__version__
