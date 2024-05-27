@@ -1,43 +1,11 @@
-# LOKI Image Processing Pipeline (LOKI -> EcoTaxa)
+# MAZE Image Processing Pipeline
 
-(Re-)Segmentation and meta-data collection of LOKI images. 
+[![Documentation Status](https://readthedocs.org/projects/maze-image-processing-pipeline/badge/?version=latest)](https://maze-image-processing-pipeline.readthedocs.io/en/latest/?badge=latest)
 
-## Usage
+The MAZE Image Processing Pipeline (MAZE-IPP) is a comprehensive tool for advanced marine biological research, integrating three specialized modules to enhance zooplankton imagery analysis:
 
-Execute a task defined in a YAML configuration file:
+- (Re-)Segmentation and meta-data collection of LOKI images (`maze-ipp loki`)
+- Semantic segmentation of calanoid copepods (`maze-ipp semseg`)
+- Fine-grained polyhierarchical identification of calanoid copepods and chaetognatha (`maze-ipp polytaxo`)
 
-```sh
-python pipeline.py task.yaml
-```
-
-### Example configuration
-
-```yaml
-input:
-    ## Input path. May contain one or multiple exports.
-    path: path/to/loki-project
-
-    ## Default metadata
-    meta:
-        sample_bottomdepth: -99
-        sample_detail_location: XXX
-        sample_region: XXX
-
-    segmentation:
-        ## One of the following:
-
-        ## Simple segmentation using thresholding
-        # threshold: 128
-
-        ## Pickled segmenter
-        # stored:
-        #   pickle_fn: filename.pkl
-
-        ## PyTorch model for segmentation
-        pytorch:
-            jit_model_fn: model.jit.pt
-            device: cuda:0
-      
-output:
-  path: path/to/output-directory
-```
+For details, see the [documentation](https://maze-image-processing-pipeline.readthedocs.io/en/latest/).

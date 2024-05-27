@@ -4,18 +4,18 @@ digraph mygraph {
   edge [fontname="Helvetica,Arial,sans-serif"]
 
   node [fontname="monospace" style="filled"]
-  "maze loki"
-  "maze semseg"
-  "maze polytaxo"
+  "maze-ipp loki"
+  "maze-ipp semseg"
+  "maze-ipp polytaxo"
 
   node [fontname="Helvetica,Arial,sans-serif" style=""]
 
-  "EcoTaxa" -> "MorphoCluster" -> "EcoTaxa" -> "maze semseg" -> "EcoTaxa";
-  "EcoTaxa" -> "maze polytaxo" -> "EcoTaxa";
+  "EcoTaxa" -> "MorphoCluster" -> "EcoTaxa" -> "maze-ipp semseg" -> "EcoTaxa";
+  "EcoTaxa" -> "maze-ipp polytaxo" -> "EcoTaxa";
 
 
   node [style="rounded"];
-  "LOKI" -> "maze loki" -> "EcoTaxa";
+  "LOKI" -> "maze-ipp loki" -> "EcoTaxa";
   "UVP" -> "EcoTaxa";
   "ZooScan" -> "EcoTaxa";
 }

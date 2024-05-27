@@ -6,7 +6,7 @@ with open("README.md", "r") as fp:
     LONG_DESCRIPTION = fp.read()
 
 setup(
-    name="LOKI Image Processing Pipeline",
+    name="MAZE Image Processing Pipeline",
     version=versioneer.get_version(),
     cmdclass=versioneer.get_cmdclass(),
     author="Simon-Martin Schroeder",
@@ -15,11 +15,14 @@ setup(
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
     url="https://github.com/MOSAiC-Zooplankton-Image-Analyses/loki_pipeline",
-    # packages=find_packages("src"),
-    # package_dir={"": "src"},
-    # include_package_data=True,
-    # install_requires=[
-    # ],
+    packages=find_packages(),
+    install_requires=[
+        "parse",
+        "exceptiongroup",
+        "natsort",
+        "pathlib_abc",
+        "click",
+    ],
     # python_requires=">=3.7",
     # extras_require={
     #     "tests": [
@@ -33,7 +36,7 @@ setup(
     #         "parse",
     #     ],
     # },
-    # entry_points={},
+    entry_points={"console_scripts": ["maze-ipp=maze_ipp.cli:main"]},
     # classifiers=[
     #     "Programming Language :: Python :: 3",
     #     "Programming Language :: Python :: 3.7",

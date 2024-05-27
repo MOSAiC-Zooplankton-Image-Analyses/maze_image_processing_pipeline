@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0", "versioneer[toml]"]
+build-backend = "setuptools.build_meta"
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440"
+versionfile_source = "maze_ipp/_version.py"
+versionfile_build = "maze_ipp/_version.py"
+tag_prefix = ""

@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.abspath(".."))
 
 
-project = "MAZE"
+project = "MAZE-IPP"
 copyright = "2024, Simon-Martin Schröder"
 author = "Simon-Martin Schröder"
 

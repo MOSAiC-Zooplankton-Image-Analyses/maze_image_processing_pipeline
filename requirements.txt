@@ -1,5 +1,0 @@
-parse
-exceptiongroup
-natsort
-pathlib_abc
-click

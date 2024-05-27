@@ -302,7 +302,7 @@ class SegmentationPipelineConfig(BaseModel):
 
 
 if __name__ == "__main__":
-    from textwrap import indent
+    from textwrap import indent, wrap
     from pydantic_core import PydanticUndefined
     from pydantic.fields import FieldInfo
     from typing import get_origin, get_args
@@ -364,7 +364,9 @@ if __name__ == "__main__":
 
             example, modifier = get_yaml_example_field(name, field)
 
-            result.append(f"## {field.description} [{modifier}]")
+            result.append(
+                indent("\n".join(wrap(f"[{modifier}] {field.description}")), "## ")
+            )
             result.append(example)
 
         result.append("")
