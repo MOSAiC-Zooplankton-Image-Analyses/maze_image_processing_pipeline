@@ -1,0 +1,21 @@
+digraph mygraph {
+  fontname="Helvetica,Arial,sans-serif"
+  node [shape=box margin="0.25,0"];
+  edge [fontname="Helvetica,Arial,sans-serif"]
+
+  node [fontname="monospace" style="filled"]
+  "maze loki"
+  "maze semseg"
+  "maze polytaxo"
+
+  node [fontname="Helvetica,Arial,sans-serif" style=""]
+
+  "EcoTaxa" -> "MorphoCluster" -> "EcoTaxa" -> "maze semseg" -> "EcoTaxa";
+  "EcoTaxa" -> "maze polytaxo" -> "EcoTaxa";
+
+
+  node [style="rounded"];
+  "LOKI" -> "maze loki" -> "EcoTaxa";
+  "UVP" -> "EcoTaxa";
+  "ZooScan" -> "EcoTaxa";
+}

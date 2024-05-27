@@ -19,7 +19,11 @@ author = "Simon-Martin Schröder"
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = ["sphinxcontrib.autodoc_pydantic", "sphinxcontrib.programoutput"]
+extensions = [
+    "sphinxcontrib.autodoc_pydantic",
+    "sphinxcontrib.programoutput",
+    "sphinx.ext.graphviz",
+]
 
 autodoc_pydantic_model_show_json = False
 autodoc_pydantic_model_show_config_summary = False
