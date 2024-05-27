@@ -7,6 +7,7 @@ dependencies:
   - pytorch==1.12.1
   - torchvision==0.13.1
   - pytorch-cuda=11.6
+  - mkl<2024
   - scikit-image
   - scikit-learn
   - matplotlib
@@ -28,5 +29,8 @@ dependencies:
     - envparse
     - marshmallow
     - omni-archive
-    - prefixed
-    - click
+    - rich
+    - parse
+    - git+https://github.com/morphocut/morphocut.git@loki
+    - git+https://github.com/moi90/pyecotaxa.git@cli
+    - git+https://github.com/MOSAiC-Zooplankton-Image-Analyses/lokidata.git

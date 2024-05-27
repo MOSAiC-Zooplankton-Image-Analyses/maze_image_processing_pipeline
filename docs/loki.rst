@@ -17,15 +17,18 @@ It provides the following features:
 Configuration
 -------------
 
-Here is an example configuration file:
+Here is the example configuration:
 
-.. program-output:: python ../config_schema.py
+.. program-output:: maze-ipp loki-config
+
+The example configuration can be generated using the `maze-ipp loki-config` command.
+
 
 Configuration Schema
 ~~~~~~~~~~~~~~~~~~~~
 
 This is the complete documentation for the configuration of the pipeline:
 
-.. automodule:: config_schema
+.. automodule:: maze_ipp.loki.config_schema
    :exclude-members: DefaultModel, TrueToDefaultsModel
    :members:

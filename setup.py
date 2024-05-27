@@ -6,7 +6,7 @@ with open("README.md", "r") as fp:
     LONG_DESCRIPTION = fp.read()
 
 setup(
-    name="MAZE Image Processing Pipeline",
+    name="maze_image_processing_pipeline",
     version=versioneer.get_version(),
     cmdclass=versioneer.get_cmdclass(),
     author="Simon-Martin Schroeder",
@@ -22,6 +22,7 @@ setup(
         "natsort",
         "pathlib_abc",
         "click",
+        "rich",
     ],
     # python_requires=">=3.7",
     # extras_require={
@@ -36,7 +37,7 @@ setup(
     #         "parse",
     #     ],
     # },
-    entry_points={"console_scripts": ["maze-ipp=maze_ipp.cli:main"]},
+    entry_points={"console_scripts": ["maze-ipp=maze_ipp.cli:cli"]},
     # classifiers=[
     #     "Programming Language :: Python :: 3",
     #     "Programming Language :: Python :: 3.7",

@@ -5,6 +5,7 @@ MorphoCluster
 --------------------
 
 .. code:: sh
+   
     # Get a full copy of EcoTaxa taxonomy tree
     # (The tree is stored in <taxonomy-fn>)
     pyecotaxa pull-taxonomy --format=<raw|yaml|...> <taxonomy-fn>

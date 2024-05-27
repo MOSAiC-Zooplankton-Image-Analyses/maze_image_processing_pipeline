@@ -8,23 +8,12 @@ import os
 import pathlib
 import sys
 import warnings
-from typing import (
-    Collection,
-    Dict,
-    Iterator,
-    Literal,
-    Mapping,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import Collection, Dict, Iterator, Mapping, Sequence, Tuple, Union
 
-import click
-from morphocut.utils import StreamEstimator
-import pydantic
-
-import _version
 import exceptiongroup
+import lokidata
+import maze_ipp
+import morphocut
 import natsort as ns
 import numpy as np
 import pandas as pd
@@ -35,18 +24,6 @@ import skimage.filters
 import skimage.measure
 import skimage.morphology
 import yaml
-from merge_labels import merge_labels
-from omni_archive import Archive
-from pathlib_abc import PathBase, PurePathBase
-from pyecotaxa.archive import read_tsv
-from rich.highlighter import NullHighlighter
-from skimage.feature.orb import ORB
-from skimage.measure._regionprops import RegionProperties
-from tqdm import tqdm
-from zoomie2 import DetectDuplicatesSimple
-
-import lokidata
-import morphocut
 from morphocut import Pipeline
 from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -75,8 +52,18 @@ from morphocut.stream import Progress as LiveProgress
 from morphocut.stream import Slice, StreamBuffer, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
+from morphocut.utils import StreamEstimator
+from omni_archive import Archive
+from pathlib_abc import PathBase, PurePathBase
+from pyecotaxa.archive import read_tsv
+from rich.highlighter import NullHighlighter
+from rich.logging import RichHandler
+from skimage.feature.orb import ORB
+from skimage.measure._regionprops import RegionProperties
+from tqdm import tqdm
 
-from config_schema import (
+from ..merge_labels import merge_labels
+from .config_schema import (
     DetectDuplicatesModelOrFalse,
     EcoTaxaOutputConfig,
     LokiInputConfig,
@@ -86,6 +73,7 @@ from config_schema import (
     SegmentationPostprocessingConfig,
     ThresholdSegmentationConfig,
 )
+from .zoomie2 import DetectDuplicatesSimple
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
@@ -95,7 +83,7 @@ if sys.stdout.isatty():
 else:
     from functools import partial
 
-    from log_progress import LogProgress
+    from ..log_progress import LogProgress
 
     # Set log_interval to 3min
     Progress = partial(LogProgress, log_interval=3 * 60)
@@ -1109,9 +1097,7 @@ def build_and_run_pipeline(pipeline_config: SegmentationPipelineConfig):
         process_meta = {}
 
         process_meta["process_morphocut_version"] = morphocut.__version__
-        process_meta["process_loki_pipeline_version"] = _version.get_versions()[
-            "version"
-        ]
+        process_meta["process_loki_pipeline_version"] = maze_ipp.__version__
         process_meta["process_skimage_version"] = skimage.__version__
         # TODO: More process metadata
 
@@ -1220,13 +1206,7 @@ def filename_suffix(fn: str, suffix: str):
     return stem + suffix + ext
 
 
-@click.command()
-@click.argument("task_fn", type=click.Path(exists=True))
-def main(task_fn):
-    import sys
-
-    from rich.logging import RichHandler
-
+def main(task_fn: str):
     # Setup logging
     root_logger = logging.getLogger()
     stream_handler = RichHandler(highlighter=NullHighlighter())
@@ -1283,7 +1263,3 @@ def main(task_fn):
             logger.error(str(exc))
         else:
             build_and_run_pipeline(segmentation_pipeline_cfg)  # type: ignore
-
-
-if __name__ == "__main__":
-    main()
