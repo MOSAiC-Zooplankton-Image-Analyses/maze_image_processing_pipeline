@@ -23,6 +23,7 @@ setup(
         "pathlib_abc",
         "click",
         "rich",
+        "pydantic",
     ],
     # python_requires=">=3.7",
     # extras_require={

@@ -34,3 +34,4 @@ dependencies:
     - git+https://github.com/morphocut/morphocut.git@loki
     - git+https://github.com/moi90/pyecotaxa.git@cli
     - git+https://github.com/MOSAiC-Zooplankton-Image-Analyses/lokidata.git
+    - -e .

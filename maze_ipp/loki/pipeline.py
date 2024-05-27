@@ -18,6 +18,7 @@ import natsort as ns
 import numpy as np
 import pandas as pd
 import parse
+import pydantic
 import skimage.color
 import skimage.exposure
 import skimage.filters
@@ -1216,7 +1217,7 @@ def main(task_fn: str):
 
     sys.path.insert(0, os.path.realpath(os.curdir))
 
-    os.chdir(os.path.dirname(task_fn))
+    os.chdir(os.path.dirname(task_fn) or ".")
 
     task_name = os.path.splitext(os.path.basename(task_fn))[0]
     task_fn_modified = datetime.datetime.fromtimestamp(os.stat(task_fn).st_mtime)
