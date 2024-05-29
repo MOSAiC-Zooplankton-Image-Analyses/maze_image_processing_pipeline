@@ -796,21 +796,21 @@ def build_input(
     meta = Call(lambda meta, default_meta: {**meta, **default_meta}, meta, default_meta)
 
     # Discover samples
-    _sample_roots: Iterator[str] = _find_files_glob(
-        input_config.path, input_config.ignore_patterns
-    )
+    sample_roots = [
+        Archive(fn)
+        for fn in _find_files_glob(input_config.path, input_config.ignore_patterns)
+    ]
 
     if input_config.discover:
+        logger.info(f"Discovering LOKI samples in {input_config.path}...")
 
-        def _find_sample_roots(sample_roots):
-            for sample_root in sample_roots:
-                yield from lokidata.find_data_roots(
-                    input_config.path, input_config.ignore_patterns
-                )
-
-        _sample_roots = _find_sample_roots(_sample_roots)
-
-    sample_roots = [Archive(fn) for fn in _sample_roots]
+        sample_roots = [
+            fn if isinstance(fn, Archive) else Archive(fn)
+            for sample_root in sample_roots
+            for fn in lokidata.find_data_roots(
+                sample_root, input_config.ignore_patterns
+            )
+        ]
 
     logger.info(f"Found {len(sample_roots):d} input directories in {input_config.path}")
 
@@ -1210,10 +1210,10 @@ def filename_suffix(fn: str, suffix: str):
 def main(task_fn: str):
     # Setup logging
     root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
     stream_handler = RichHandler(highlighter=NullHighlighter())
     stream_handler.setLevel(logging.DEBUG)
     root_logger.addHandler(stream_handler)
-    root_logger.setLevel(logging.INFO)
 
     sys.path.insert(0, os.path.realpath(os.curdir))
 

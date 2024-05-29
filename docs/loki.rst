@@ -5,6 +5,7 @@ The `maze-ipp loki` command implements a image processing pipeline for the reseg
 
 It provides the following features:
 
+- Sample folder discovery
 - Merging of telemetry metadata.
 - Segmentation using thresholding or a deep learning model.
 - Duplicate Detection
@@ -13,6 +14,13 @@ It provides the following features:
 - Logging and error handling
 - Progress reporting
 - `YAML <https://en.wikipedia.org/wiki/YAML>`_ configuration.
+
+Sample folder discovery
+-----------------------
+
+By default, the input :attr:`~maze_ipp.loki.config_schema.LokiInputConfig.path` is searched for valid sample folders.
+Sample folders are recognized if they contain the subfolders `"Telemetrie"` and `"Pictures"`.
+This sample folder discovery can be disabled by setting :attr:`~maze_ipp.loki.config_schema.LokiInputConfig.discover` to `false`.
 
 Configuration
 -------------
