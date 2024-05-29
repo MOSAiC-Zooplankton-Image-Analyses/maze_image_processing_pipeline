@@ -5,7 +5,6 @@ The `maze-ipp loki` command implements a image processing pipeline for the reseg
 
 It provides the following features:
 
-- `YAML <https://en.wikipedia.org/wiki/YAML>`_ configuration.
 - Merging of telemetry metadata.
 - Segmentation using thresholding or a deep learning model.
 - Duplicate Detection
@@ -13,6 +12,7 @@ It provides the following features:
 - Generation of import-ready EcoTaxa archives
 - Logging and error handling
 - Progress reporting
+- `YAML <https://en.wikipedia.org/wiki/YAML>`_ configuration.
 
 Configuration
 -------------
