@@ -812,7 +812,7 @@ def build_input(
 
     sample_roots = [Archive(fn) for fn in _sample_roots]
 
-    logger.info(f"Found {len(sample_roots):d} input directories")
+    logger.info(f"Found {len(sample_roots):d} input directories in {input_config.path}")
 
     sample_root = Unpack(ns.natsorted(sample_roots, alg=ns.PATH | ns.IGNORECASE))
 
@@ -1264,3 +1264,5 @@ def main(task_fn: str):
             logger.error(str(exc))
         else:
             build_and_run_pipeline(segmentation_pipeline_cfg)  # type: ignore
+
+    root_logger.info("Finished processing.")

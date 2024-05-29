@@ -24,6 +24,7 @@ setup(
         "click",
         "rich",
         "pydantic",
+        "prefixed",
     ],
     # python_requires=">=3.7",
     # extras_require={

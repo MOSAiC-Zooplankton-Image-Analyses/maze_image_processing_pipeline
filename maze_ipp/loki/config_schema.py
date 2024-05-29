@@ -71,7 +71,9 @@ class ThresholdSegmentationConfig(DefaultModel):
 
 class StitchConfig(TrueToDefaultsModel):
     skip_single: bool = Field(
-        False, description="Remove stitched frames with only one object (debug)."
+        False,
+        description="Remove stitched frames with only one object (debug).",
+        json_schema_extra={"debug": True},
     )
 
 
@@ -113,6 +115,7 @@ class PytorchSegmentationConfig(DefaultModel):
     full_frame_archive_fn: str | None = Field(
         None,
         description="Write segmented full-frames to this file in the target directory (debug).",
+        json_schema_extra={"debug": True},
     )
 
     # Settings for ExtractROI
@@ -197,7 +200,9 @@ class LokiInputConfig(BaseModel):
     )
 
     slice: int | None = Field(
-        None, description="Process only this many objects (for debugging)."
+        None,
+        description="Process only this many objects (for debugging).",
+        json_schema_extra={"debug": True},
     )
 
     default_meta: Dict = Field({}, description="Default metadata for all objects.")
@@ -213,6 +218,7 @@ class LokiInputConfig(BaseModel):
     save_meta: bool = Field(
         False,
         description="Save calculated input metadata in the target directory (for debugging).",
+        json_schema_extra={"debug": True},
     )
 
     # Detect duplicates
@@ -247,7 +253,9 @@ class PostprocessingConfig(BaseModel):
     )
 
     slice: int | None = Field(
-        None, description="Process only this many objects (for debugging)."
+        None,
+        description="Process only this many objects (for debugging).",
+        json_schema_extra={"debug": True},
     )
 
     filter_expr: str | None = Field(

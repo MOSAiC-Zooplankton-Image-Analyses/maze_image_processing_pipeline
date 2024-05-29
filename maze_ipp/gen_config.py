@@ -55,6 +55,11 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
 
     result = []
     for name, field in model.model_fields.items():
+        if (field.json_schema_extra is not None) and field.json_schema_extra.get(
+            "debug", False
+        ):
+            continue
+
         if field.description is None:
             raise ValueError(f"{name} has no description")
 
