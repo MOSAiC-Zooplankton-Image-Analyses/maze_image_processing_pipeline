@@ -11,6 +11,7 @@ Semantic segmentation
 `semantic_segmentation.yaml` is configured in the following way:
 
 .. TODO: Link model file
+
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained semantic segmentation model.
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.tiled` must be `true` so that the model is applied to all image regions.
 If :attr:`~maze_ipp.predict.config_schema.SegmentationConfig.draw` is `true`, the detected segments will be stored alongside the measurements.
@@ -26,6 +27,7 @@ Feature calculation
 `extract_features.yaml` is configured in the following way:
 
 .. TODO: Link model file
+
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained feature extractor model.
 
 Polyhierarchical classification
@@ -45,6 +47,7 @@ Polyhierarchical classification is implement as a two-step process: predicting i
 `polytaxo.yaml` is configured in the following way:
 
 .. TODO: Link model file
+
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained polytaxo classifier model.
 
 Configuration
