@@ -24,8 +24,5 @@ Interfacing with EcoTaxa is implemented using `pyecotaxa <https://github.com/eco
    
    installation
    loki
+   predict
    morphocluster
-   polytaxo
-   semseg
-   ecotaxa
-   oilsac

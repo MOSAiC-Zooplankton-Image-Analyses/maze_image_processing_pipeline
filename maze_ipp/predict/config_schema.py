@@ -1,5 +1,7 @@
-from typing import Any, List, Mapping, OrderedDict, Sequence, Tuple
+from typing import List, Literal, OrderedDict, Sequence
 from pydantic import BaseModel, ConfigDict, Field
+
+from ..common import TrueToDefaultsModel
 
 
 class EcoTaxaInputConfig(BaseModel):
@@ -24,8 +26,12 @@ class DataDescriptorSchema(BaseModel):
 
 
 class ModelMetaSchema(BaseModel):
-    inputs: OrderedDict[str, DataDescriptorSchema] = Field()
-    outputs: OrderedDict[str, DataDescriptorSchema] = Field()
+    # inputs: OrderedDict[str, DataDescriptorSchema] = Field(
+    #     description="Ordered mapping of input names to input descriptions."
+    # )
+    outputs: OrderedDict[str, DataDescriptorSchema] = Field(
+        description='Ordered mapping of output names to output descriptions, e.g. {"pred": ["Prosoma", "Oilsack"]}. Only a single output is supported.'
+    )
 
     model_config = ConfigDict(
         extra="allow",
@@ -55,7 +61,16 @@ class ModelConfig(BaseModel):
         "float32", description="Datatype to use for the processing (e.g. 'float32')"
     )
 
-    meta: ModelMetaSchema | None = Field(None, description="Model metadata")
+    meta: ModelMetaSchema | None = Field(None, description="Model metadata.")
+
+    tiled: bool = Field(
+        False,
+        description="Apply the model to square tiles on each input image. Required for semantic segmentation.",
+    )
+
+
+class SegmentationConfig(TrueToDefaultsModel):
+    draw: bool = Field(False, description="Draw segments.")
 
 
 class PredictionPipelineConfig(BaseModel):
@@ -65,10 +80,12 @@ class PredictionPipelineConfig(BaseModel):
     model: ModelConfig = Field(description="Configuration of the input.")
 
     save_raw_predictions: bool = Field(
-        False, description="Save raw predictions into an HDF5 file."
+        False,
+        description="Save raw predictions into an HDF5 file, e.g. for feature extraction or polytaxo classification.",
     )
-    measure_segments: bool = Field(
-        False, description="Measure predicted segments and store into EcoTaxa archive."
+    segmentation: SegmentationConfig | Literal[False] = Field(
+        None,
+        description="Measure predicted segments and store into EcoTaxa archive. (Only applies for semantic segmentation.)",
     )
 
     target_dir: str = Field(description="Directory where the output files are created.")

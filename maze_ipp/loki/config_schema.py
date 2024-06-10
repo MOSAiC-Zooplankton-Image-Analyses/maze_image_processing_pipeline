@@ -1,40 +1,8 @@
-from typing import (
-    Any,
-    ClassVar,
-    Dict,
-    List,
-    Literal,
-    Mapping,
-    Tuple,
-    Type,
-    Union,
-)
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    model_validator,
-    Field,
-)
+from typing import Any, Dict, List, Literal
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-class DefaultModel(BaseModel):
-    __default_field__: ClassVar[str]
-
-    @model_validator(mode="before")
-    @classmethod
-    def parse_shortform(cls, data: Any):
-        if not isinstance(data, Mapping):
-            return {cls.__default_field__: data}
-        return data
-
-
-class TrueToDefaultsModel(BaseModel):
-    @model_validator(mode="before")
-    @classmethod
-    def parse_shortform(cls, data: Any):
-        if data is True:
-            return {}
-        return data
+from ..common import DefaultModel, TrueToDefaultsModel
 
 
 class SegmentationPostprocessingConfig(TrueToDefaultsModel):
