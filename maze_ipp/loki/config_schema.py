@@ -307,13 +307,3 @@ class SegmentationPipelineConfig(BaseModel):
         description="Configuration of the post-processing."
     )
     output: EcoTaxaOutputConfig = Field(description="Configuration of the output.")
-
-
-def generate_yaml_example():
-    from maze_ipp.gen_config import generate_yaml_example
-
-    print(generate_yaml_example(SegmentationPipelineConfig))
-
-
-if __name__ == "__main__":
-    generate_yaml_example()

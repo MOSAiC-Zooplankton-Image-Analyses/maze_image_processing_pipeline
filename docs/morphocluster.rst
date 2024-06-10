@@ -1,6 +1,9 @@
 MorphoCluster
 =============
 
+MorphoCluster is utilized to pre-sort images through clustering.
+Similar images are grouped together based on visual features, significantly enhancing efficiency and consistency of the classification.
+
 1. Pull EcoTaxa data
 --------------------
 
@@ -21,27 +24,20 @@ MorphoCluster
 2. Annotate using MorphoCluster
 -------------------------------
 
-3.1. Import
-~~~~~~~~~~~
+Annotation using MorphoCluster involves a series of structured steps to effectively cluster and annotate plankton images (see Schroeder et al. 2020).
+First, images and metadata imported from an EcoTaxa archive.
+Features of these images are then extracted using a deep learning model.
+The images are annotated using the MorphoCluster web application, where users can validate and refine clusters.
+In the end, annotations are exported.
 
-3.2. Annotation
-~~~~~~~~~~~~~~~
-
-3.3. Export Annotations
-~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code:: sh
-
-    flask export ...
-
-4. Map MorphoCluster labels to EcoTaxa categories
+3. Map MorphoCluster labels to EcoTaxa categories
 -------------------------------------------------
 
 .. code:: sh
 
    pyecotaxa map-categories --taxonomy <taxonomy-fn>
 
-4a. Merge annotations back into project data
+3a. Merge annotations back into project data
 --------------------------------------------
 
 (This step might be necessary if multiple EcoTaxa projects were
@@ -57,7 +53,7 @@ be overwritten.)
    #       (This avoids overwriting already validated annotations.)
    pyecotaxa merge --annotation-only --predicted-only <export-archive-fn> annotations.tsv <output-fn>
 
-5. Push annotated data back to EcoTaxa
+4. Push annotated data back to EcoTaxa
 --------------------------------------
 
 .. code:: sh

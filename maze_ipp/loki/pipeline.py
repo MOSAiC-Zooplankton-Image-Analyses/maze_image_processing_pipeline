@@ -8,7 +8,7 @@ import os
 import pathlib
 import sys
 import warnings
-from typing import Collection, Dict, Iterator, Mapping, Sequence, Tuple, Union
+from typing import Collection, Dict, Mapping, Sequence, Tuple, Union
 
 import exceptiongroup
 import lokidata
@@ -24,7 +24,6 @@ import skimage.exposure
 import skimage.filters
 import skimage.measure
 import skimage.morphology
-import yaml
 from morphocut import Pipeline
 from morphocut.batch import BatchedPipeline
 from morphocut.contrib.ecotaxa import EcotaxaWriter
@@ -57,13 +56,13 @@ from morphocut.utils import StreamEstimator
 from omni_archive import Archive
 from pathlib_abc import PathBase, PurePathBase
 from pyecotaxa.archive import read_tsv
-from rich.highlighter import NullHighlighter
-from rich.logging import RichHandler
 from skimage.feature.orb import ORB
 from skimage.measure._regionprops import RegionProperties
 from tqdm import tqdm
 
+from ..common import convert_img_dtype
 from ..merge_labels import merge_labels
+from ..pipeline_runner import PipelineRunner
 from .config_schema import (
     DetectDuplicatesModelOrFalse,
     EcoTaxaOutputConfig,
@@ -394,20 +393,6 @@ def assert_compatible_shape(label, image):
         raise
 
 
-def convert_img_dtype(image, dtype: np.dtype):
-    image = np.asarray(image)
-
-    if dtype.kind == "f":
-        if image.dtype.kind == "u":
-            factor = np.array(1.0 / np.iinfo(image.dtype).max, dtype=dtype)
-            return np.multiply(image, factor)
-
-        if image.dtype.kind == "f":
-            return np.asarray(image, dtype)
-
-    raise ValueError(f"Can not convert {image.dtype} to {dtype}.")
-
-
 def build_segmentation_postprocessing(
     config: SegmentationPostprocessingConfig, foreground_pred
 ):
@@ -507,7 +492,7 @@ def build_pytorch_segmentation(
 
     model = torch.jit.load(config.model_fn, map_location=device)
 
-    assert isinstance(model, torch.nn.Module), "Model is not a torch.nn.Module"
+    assert isinstance(model, torch.jit.ScriptModule)
 
     # Convert model to the specified dtype
     torch_dtype = getattr(torch, dtype)
@@ -1084,185 +1069,128 @@ class MergeAnnotations(Node):
         return meta
 
 
-def build_and_run_pipeline(pipeline_config: SegmentationPipelineConfig):
-    """
-    Args:
-        input_path (str): Path to LOKI data (directory containing "Pictures" and "Telemetrie").
-
-    Example:
-        python pipeline.py /media/mschroeder/LOKI-Daten/LOKI/PS101/0059_PS101-59/
-    """
-
-    with Pipeline() as p:
-        process_meta_var = Variable("process_meta", p)
-        process_meta = {}
-
-        process_meta["process_morphocut_version"] = morphocut.__version__
-        process_meta["process_loki_pipeline_version"] = maze_ipp.__version__
-        process_meta["process_skimage_version"] = skimage.__version__
-        # TODO: More process metadata
-
-        image, meta, target_archive_fn = build_input(
-            pipeline_config.input,
-            pipeline_config.output,
-            process_meta_var,
-            process_meta,
-        )
-
-        Progress("Input objects")
-
-        image, meta, mask = build_segmentation(
-            pipeline_config.segmentation,
-            pipeline_config.output.target_dir,
-            image,
-            meta,
-            process_meta,
-        )
-
-        StreamBuffer(8)
-
-        # Post-Processing
-        postprocess_config = pipeline_config.postprocess
-
-        build_duplicate_detection(
-            postprocess_config.detect_duplicates,
-            image,
-            meta,
-            "output",
-            process_meta,
-        )
-
-        process_meta["process_rescale_max_intensity"] = (
-            postprocess_config.rescale_max_intensity
-        )
-
-        if postprocess_config.rescale_max_intensity:
-            logger.info(f"Rescaling intensity of output images")
-            # Image enhancement: Stretch contrast
-            image = Call(rescale_max_intensity, image)
-
-        if postprocess_config.scalebar is not None:
-            scalebar_config = postprocess_config.scalebar
-            process_meta["process_scalebar_px_per_mm"] = scalebar_config.px_per_mm
-
-            logger.info("Drawing scalebar")
-            image = DrawScalebar(
-                image,
-                length_in_unit=1,
-                px_per_unit=scalebar_config.px_per_mm,
-                unit="mm",
-                fg_color=255,
-                bg_color=0,
-            )
-
-        if postprocess_config.merge_annotations is not None:
-            logger.info(f"Merging annotations: {postprocess_config.merge_annotations}")
-            meta = MergeAnnotations(
-                meta, **postprocess_config.merge_annotations.model_dump()
-            )
-
-        # DEBUG: Slice
-        if postprocess_config.slice is not None:
-            logger.warning(
-                f"Only processing the first {postprocess_config.slice} output objects."
-            )
-            Slice(postprocess_config.slice)
-
-        if postprocess_config.filter_expr is not None:
-            logger.info(f"Filtering output by expression {output_config.filter_expr!r}")
-
-            FilterEval(output_config.filter_expr, meta)
-
-        ## Output
-        output_config = pipeline_config.output
-
-        target_image_fn = Call(output_config.image_fn.format_map, meta)
-        output_images = [(target_image_fn, image)]
-        if output_config.store_mask:
-            target_mask_fn = Call(filename_suffix, target_image_fn, "_mask")
-            output_images.append((target_mask_fn, mask))
-
-        EcotaxaWriter(
-            target_archive_fn,
-            output_images,
-            meta,
-            store_types=output_config.type_header,
-        )
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            "Only one label was provided to `remove_small_objects`",
-            UserWarning,
-        )
-
-        # Inject pipeline metadata into the stream
-        obj = StreamObject(n_remaining_hint=1)
-        obj[process_meta_var] = process_meta
-        p.run(iter([obj]))
-
-
 def filename_suffix(fn: str, suffix: str):
     stem, ext = os.path.splitext(fn)
     return stem + suffix + ext
 
 
-def main(task_fn: str):
-    # Setup logging
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    stream_handler = RichHandler(highlighter=NullHighlighter())
-    stream_handler.setLevel(logging.DEBUG)
-    root_logger.addHandler(stream_handler)
-
-    sys.path.insert(0, os.path.realpath(os.curdir))
-
-    os.chdir(os.path.dirname(task_fn) or ".")
-
-    task_name = os.path.splitext(os.path.basename(task_fn))[0]
-    task_fn_modified = datetime.datetime.fromtimestamp(os.stat(task_fn).st_mtime)
-
-    log_fn = os.path.abspath(
-        f'{task_name}-{datetime.datetime.now().isoformat(timespec="seconds")}.log'
-    )
-    print(f"Logging to {log_fn}.")
-    file_handler = logging.FileHandler(log_fn)
-    file_handler.setLevel(logging.DEBUG)
-    root_logger.addHandler(file_handler)
-
-    # Also capture exceptions
-
-    def log_except_hook(*exc_info):
-        root_logger.error("Unhandled exception", exc_info=exc_info)  # type: ignore
-
-    sys.excepthook = log_except_hook
-
-    # # Also capture py.warnings
-    # warnings_logger = logging.getLogger("py.warnings")
-    # warnings_logger.addHandler(file_handler)
-    # warnings_logger.addHandler(stream_handler)
-    # warnings_logger.setLevel(logging.INFO)
-
-    root_logger.info(
-        f"Loading pipeline config from {task_fn} ({task_fn_modified.isoformat(timespec='seconds')})"
-    )
-
-    # logging.getLogger("zoomie2").setLevel(logging.DEBUG)
-
-    log_levels = {
-        name: logging.getLevelName(logging.getLogger(name).getEffectiveLevel())
-        for name in sorted(root_logger.manager.loggerDict)
-    }
-    root_logger.info(f"Log levels: {log_levels}")
-
-    with open(task_fn) as f:
+class Runner(PipelineRunner):
+    @staticmethod
+    def _configure_and_run(config_dict):
         try:
-            segmentation_pipeline_cfg = SegmentationPipelineConfig.model_validate(
-                yaml.safe_load(f)
-            )
+            pipeline_config = SegmentationPipelineConfig.model_validate(config_dict)
         except pydantic.ValidationError as exc:
             logger.error(str(exc))
-        else:
-            build_and_run_pipeline(segmentation_pipeline_cfg)  # type: ignore
+            return
 
-    root_logger.info("Finished processing.")
+        with Pipeline() as p:
+            process_meta_var = Variable("process_meta", p)
+            process_meta = {}
+
+            process_meta["process_morphocut_version"] = morphocut.__version__
+            process_meta["process_loki_pipeline_version"] = maze_ipp.__version__
+            process_meta["process_skimage_version"] = skimage.__version__
+            # TODO: More process metadata
+
+            image, meta, target_archive_fn = build_input(
+                pipeline_config.input,
+                pipeline_config.output,
+                process_meta_var,
+                process_meta,
+            )
+
+            Progress("Input objects")
+
+            image, meta, mask = build_segmentation(
+                pipeline_config.segmentation,
+                pipeline_config.output.target_dir,
+                image,
+                meta,
+                process_meta,
+            )
+
+            StreamBuffer(8)
+
+            # Post-Processing
+            postprocess_config = pipeline_config.postprocess
+
+            build_duplicate_detection(
+                postprocess_config.detect_duplicates,
+                image,
+                meta,
+                "output",
+                process_meta,
+            )
+
+            process_meta["process_rescale_max_intensity"] = (
+                postprocess_config.rescale_max_intensity
+            )
+
+            if postprocess_config.rescale_max_intensity:
+                logger.info(f"Rescaling intensity of output images")
+                # Image enhancement: Stretch contrast
+                image = Call(rescale_max_intensity, image)
+
+            if postprocess_config.scalebar is not None:
+                scalebar_config = postprocess_config.scalebar
+                process_meta["process_scalebar_px_per_mm"] = scalebar_config.px_per_mm
+
+                logger.info("Drawing scalebar")
+                image = DrawScalebar(
+                    image,
+                    length_in_unit=1,
+                    px_per_unit=scalebar_config.px_per_mm,
+                    unit="mm",
+                    fg_color=255,
+                    bg_color=0,
+                )
+
+            if postprocess_config.merge_annotations is not None:
+                logger.info(
+                    f"Merging annotations: {postprocess_config.merge_annotations}"
+                )
+                meta = MergeAnnotations(
+                    meta, **postprocess_config.merge_annotations.model_dump()
+                )
+
+            # DEBUG: Slice
+            if postprocess_config.slice is not None:
+                logger.warning(
+                    f"Only processing the first {postprocess_config.slice} output objects."
+                )
+                Slice(postprocess_config.slice)
+
+            if postprocess_config.filter_expr is not None:
+                logger.info(
+                    f"Filtering output by expression {output_config.filter_expr!r}"
+                )
+
+                FilterEval(output_config.filter_expr, meta)
+
+            ## Output
+            output_config = pipeline_config.output
+
+            target_image_fn = Call(output_config.image_fn.format_map, meta)
+            output_images = [(target_image_fn, image)]
+            if output_config.store_mask:
+                target_mask_fn = Call(filename_suffix, target_image_fn, "_mask")
+                output_images.append((target_mask_fn, mask))
+
+            EcotaxaWriter(
+                target_archive_fn,
+                output_images,
+                meta,
+                store_types=output_config.type_header,
+            )
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                "Only one label was provided to `remove_small_objects`",
+                UserWarning,
+            )
+
+            # Inject pipeline metadata into the stream
+            obj = StreamObject(n_remaining_hint=1)
+            obj[process_meta_var] = process_meta
+            p.run(iter([obj]))

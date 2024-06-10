@@ -1,7 +1,7 @@
 LOKI Resegmentation
 ===================
 
-The `maze-ipp loki` command implements a image processing pipeline for the resegmentation of raw data captured by the LOKI imaging system.
+The `maze-ipp loki` command implements an image processing pipeline for the resegmentation of raw data captured by the LOKI imaging system.
 
 It provides the following features:
 
@@ -27,9 +27,9 @@ Configuration
 
 Here is the example configuration:
 
-.. program-output:: maze-ipp loki-config
+.. program-output:: maze-ipp config loki
 
-The example configuration can be generated using the `maze-ipp loki-config` command.
+The example configuration can be generated using the `maze-ipp config loki` command.
 
 
 Configuration Schema

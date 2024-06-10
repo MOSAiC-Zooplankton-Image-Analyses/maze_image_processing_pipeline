@@ -1,0 +1,7 @@
+digraph mygraph {
+  rankdir="LR";
+  fontname="Helvetica,Arial,sans-serif"
+  node [shape=box margin="0.25,0", style="rounded"];
+  edge [fontname="Helvetica,Arial,sans-serif"]
+  "LOKI" -> "Resegmentation" -> "Classification (Order/.../Species)" -> "Classification (orientation/sex/...)";
+}

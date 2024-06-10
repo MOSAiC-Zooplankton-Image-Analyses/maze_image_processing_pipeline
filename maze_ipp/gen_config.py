@@ -41,7 +41,9 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
                 "optional",
             )
 
-        if issubclass(field.annotation, BaseModel):
+        if isinstance(field.annotation, type) and issubclass(
+            field.annotation, BaseModel
+        ):
             return (
                 f"{name}:\n"
                 + indent(

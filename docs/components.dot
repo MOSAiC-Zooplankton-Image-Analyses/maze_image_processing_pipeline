@@ -1,0 +1,27 @@
+digraph mygraph {
+  fontname="Helvetica,Arial,sans-serif"
+  node [fontname="Helvetica,Arial,sans-serif" shape=box margin="0.25,0"];
+  edge [fontname="Helvetica,Arial,sans-serif"]
+
+  "EcoTaxa";
+  "MorphoCluster";
+
+  node [fontname="monospace" style="filled"]
+  "maze-ipp loki"
+  "maze-ipp predict"
+
+  node [fontname="Helvetica,Arial,sans-serif" style=""]
+  "PolyTaxo";
+
+  "EcoTaxa" -> "MorphoCluster" -> "EcoTaxa";
+  "EcoTaxa" -> "maze-ipp predict" -> "EcoTaxa";
+  "EcoTaxa" -> "PolyTaxo" -> "EcoTaxa";
+
+  node [style="rounded"];
+  "LOKI" -> "maze-ipp loki" -> "EcoTaxa";
+  "UVP" -> "EcoTaxa";
+  "ZooScan" -> "EcoTaxa";
+
+  {rank = same; "maze-ipp predict" -> "PolyTaxo"}
+  {rank = same; edge [dir="back"] "MorphoCluster" -> "maze-ipp predict"}
+}
