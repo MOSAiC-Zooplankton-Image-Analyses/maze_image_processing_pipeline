@@ -1,7 +1,7 @@
 from typing import List, Literal, OrderedDict, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..common import TrueToDefaultsModel
+from ..config import TrueToDefaultsModel
 
 
 class EcoTaxaInputConfig(BaseModel):

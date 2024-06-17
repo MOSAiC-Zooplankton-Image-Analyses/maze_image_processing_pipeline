@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..common import DefaultModel, TrueToDefaultsModel
+from ..config import DefaultModel, TrueToDefaultsModel
 
 
 class SegmentationPostprocessingConfig(TrueToDefaultsModel):

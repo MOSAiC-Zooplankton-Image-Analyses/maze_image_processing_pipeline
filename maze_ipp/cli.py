@@ -26,7 +26,7 @@ def loki(task_fn):
 def config(module):
     """Generate default configuration."""
 
-    from maze_ipp.gen_config import generate_yaml_example
+    from maze_ipp.config import generate_yaml_example
 
     if module == "loki":
         from maze_ipp.loki.config_schema import SegmentationPipelineConfig as Schema

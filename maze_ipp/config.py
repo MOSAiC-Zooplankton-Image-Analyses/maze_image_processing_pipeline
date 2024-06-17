@@ -1,10 +1,21 @@
-from textwrap import indent, wrap
-from pydantic_core import PydanticUndefined
-from pydantic.fields import FieldInfo
-from pydantic import BaseModel
-from typing import get_origin, get_args, Type, Tuple, Union, Literal
-from types import UnionType, NoneType
 import json
+from textwrap import indent, wrap
+from types import NoneType, UnionType
+from typing import (
+    Any,
+    ClassVar,
+    Literal,
+    Mapping,
+    Tuple,
+    Type,
+    Union,
+    get_args,
+    get_origin,
+)
+
+from pydantic import BaseModel, model_validator
+from pydantic.fields import FieldInfo
+from pydantic_core import PydanticUndefined
 
 
 def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
@@ -75,3 +86,23 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
     result.append("")
 
     return "\n".join(result)
+
+
+class DefaultModel(BaseModel):
+    __default_field__: ClassVar[str]
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_shortform(cls, data: Any):
+        if not isinstance(data, Mapping):
+            return {cls.__default_field__: data}
+        return data
+
+
+class TrueToDefaultsModel(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def parse_shortform(cls, data: Any):
+        if data is True:
+            return {}
+        return data

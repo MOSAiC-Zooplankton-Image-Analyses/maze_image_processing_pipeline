@@ -29,16 +29,14 @@ Feature calculation
 .. TODO: Link model file
 
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained feature extractor model.
+:attr:`~maze_ipp.predict.config_schema.PredictionPipelineConfig.save_raw_predictions` must be `true` so that a HDF5 file is created.
+The HDF5 file that is created will contain two datasets: `object_id` and `predictions`.
+
 
 Polyhierarchical classification
 -------------------------------
 
-Our polyhierarchical classification system combines a primary phylogenetic classification, such as family, genus, or species, with further positive and negative descriptors.
-These descriptors could include attributes, life stages, and behaviors.
-
-The richness of description offered by PolyTaxo allows us to train multi-label classifiers with outputs for each primary (class) and secondary concept (tag).
-
-Polyhierarchical classification is implement as a two-step process: predicting image features and generating polyhierarchical descriptions.
+Polyhierarchical classification is implement as a two-step process: predicting scores for each image and generating polyhierarchical descriptions.
 
 .. code-block:: python
     
@@ -50,8 +48,11 @@ Polyhierarchical classification is implement as a two-step process: predicting i
 
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained polytaxo classifier model.
 
-Configuration
--------------
+To generate polyhierarchical descriptions and, optionally, to map them back to EcoTaxa categories, the `polytaxo <https://github.com/MOSAiC-Zooplankton-Image-Analyses/polytaxo>`_ library can be used.
+
+
+Configuration Example
+---------------------
 
 Here is some general example configuration:
 
