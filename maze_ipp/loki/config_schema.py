@@ -155,8 +155,10 @@ class LokiInputConfig(BaseModel):
     )
     discover: bool = Field(
         True,
-        description="Try to discover all LOKI samples inside the specified path "
-        "by looking for directories that contain 'Pictures' and 'Telemetrie' folders.",
+        description="Try to discover all LOKI samples ('LOKI_XXXXX.XX') inside the specified path "
+        "by looking for directories that contain 'Pictures' and 'Telemetrie' folders.\n"
+        "This should only be set to False if 'Pictures' or 'Telemetrie' are missing.\n"
+        "If False, the :attr:`~maze_ipp.loki.config_schema.LokiInputConfig.path` pattern needs to point to exact locations of 'LOKI_XXXXX.XX' directories (containing 'Log', 'Pictures' and 'Telemetrie').",
     )
     ignore_patterns: List[str] = Field(
         [],

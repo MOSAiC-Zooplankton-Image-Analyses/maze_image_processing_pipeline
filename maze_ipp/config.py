@@ -1,4 +1,5 @@
 import json
+import re
 from textwrap import indent, wrap
 from types import NoneType, UnionType
 from typing import (
@@ -78,9 +79,17 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
 
         example, modifier = get_yaml_example_field(name, field)
 
-        result.append(
-            indent("\n".join(wrap(f"[{modifier}] {field.description}")), "## ")
+        description = re.sub(
+            r":attr:`([^`]*)`",
+            lambda m: (
+                m.group(1).rsplit(".")[-1] if m.group(1)[0] == "~" else m.group(1)
+            ),
+            field.description,
+            flags=re.MULTILINE,
         )
+
+        for line in f"[{modifier}] {description}".splitlines():
+            result.append(indent("\n".join(wrap(line)), "## "))
         result.append(example)
 
     result.append("")

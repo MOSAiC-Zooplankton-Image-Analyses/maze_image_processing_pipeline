@@ -124,8 +124,8 @@ def read_log_and_yaml_meta(data_root: PathBase, meta: Mapping):
     log_pat = "LOKI*.log"
     try:
         (log_fn,) = log_dir.glob(log_pat)
-    except ValueError:
-        raise ValueError(f"Could not find '{log_pat}' in '{log_dir}")
+    except ValueError as exc:
+        raise ValueError(f"Could not find '{log_pat}' in '{log_dir}'") from exc
 
     meta_fn = data_root / "meta.yaml"
 
@@ -265,10 +265,15 @@ class Telemetry:
 
         if telemetry.empty:
             files = list(p.name for p in itertools.islice(telemetry_path.iterdir(), 10))
-            if len(files) == 10:
-                files[-1] = "..."
 
-            msg = f"{data_root}/{telemetry_path} contains no readable telemetry files, just {', '.join(files)}"
+            if files:
+                if len(files) == 10:
+                    files[-1] = "..."
+
+                msg = f"{data_root}/{telemetry_path} contains no readable telemetry files, just {', '.join(files)}"
+            else:
+                msg = f"{data_root}/{telemetry_path} is empty"
+
             if ignore_errors:
                 logger.error(msg)
             else:
