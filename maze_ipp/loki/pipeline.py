@@ -120,7 +120,13 @@ class FilterEval(Node):
 
 def read_log_and_yaml_meta(data_root: PathBase, meta: Mapping):
     # Find singular log filename
-    (log_fn,) = (data_root / "Log").glob("LOKI*.log")
+    log_dir = data_root / "Log"
+    log_pat = "LOKI*.log"
+    try:
+        (log_fn,) = log_dir.glob(log_pat)
+    except ValueError:
+        raise ValueError(f"Could not find '{log_pat}' in '{log_dir}")
+
     meta_fn = data_root / "meta.yaml"
 
     # Return combination of initial meta, LOKI log metadata and yaml meta
