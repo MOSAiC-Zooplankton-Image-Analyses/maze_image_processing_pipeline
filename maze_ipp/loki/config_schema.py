@@ -277,3 +277,4 @@ class SegmentationPipelineConfig(BaseModel):
         description="Configuration of the post-processing."
     )
     output: EcoTaxaOutputConfig = Field(description="Configuration of the output.")
+    log_interval: str | float = Field("60s", description="The interval at which progress is logged, e.g. 10s or 1m.")

@@ -8,7 +8,7 @@ import os
 import pathlib
 import sys
 import warnings
-from typing import Collection, Dict, Mapping, Sequence, Tuple, Union
+from typing import Collection, Dict, Mapping, Sequence, Tuple, Type, Union
 
 import exceptiongroup
 import lokidata
@@ -77,17 +77,6 @@ from .zoomie2 import DetectDuplicatesSimple
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
-
-if sys.stdout.isatty():
-    Progress = LiveProgress
-else:
-    from functools import partial
-
-    from ..log_progress import LogProgress
-
-    # Set log_interval to 3min
-    Progress = partial(LogProgress, log_interval=3 * 60)
-
 
 class FilterEval(Node):
     """
@@ -785,6 +774,7 @@ def build_input(
     output_config: EcoTaxaOutputConfig,
     meta: Variable,
     process_meta: Dict,
+    Progress: Type[Node]
 ):
     # Insert input_meta into meta
     default_meta = input_config.default_meta
@@ -1093,6 +1083,19 @@ class Runner(PipelineRunner):
         except pydantic.ValidationError as exc:
             logger.error(str(exc))
             return
+        
+        if sys.stdout.isatty():
+            Progress = LiveProgress
+        else:
+            from functools import partial
+
+            from ..log_progress import LogProgress
+
+            log_interval = pipeline_config.log_interval
+            if isinstance(log_interval, str):
+                log_interval = pd.Timedelta(log_interval).total_seconds()
+
+            Progress = partial(LogProgress, log_interval=log_interval)
 
         with Pipeline() as p:
             process_meta_var = Variable("process_meta", p)
@@ -1108,6 +1111,7 @@ class Runner(PipelineRunner):
                 pipeline_config.output,
                 process_meta_var,
                 process_meta,
+                Progress
             )
 
             Progress("Input objects")
@@ -1138,7 +1142,7 @@ class Runner(PipelineRunner):
             )
 
             if postprocess_config.rescale_max_intensity:
-                logger.info(f"Rescaling intensity of output images")
+                logger.info(f"Rescaling intensity of output images: enabled")
                 # Image enhancement: Stretch contrast
                 image = Call(rescale_max_intensity, image)
 
@@ -1146,7 +1150,7 @@ class Runner(PipelineRunner):
                 scalebar_config = postprocess_config.scalebar
                 process_meta["process_scalebar_px_per_mm"] = scalebar_config.px_per_mm
 
-                logger.info("Drawing scalebar")
+                logger.info("Scalebar: enabled")
                 image = DrawScalebar(
                     image,
                     length_in_unit=1,
