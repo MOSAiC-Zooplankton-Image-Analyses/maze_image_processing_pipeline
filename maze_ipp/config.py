@@ -82,7 +82,9 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
         description = re.sub(
             r":attr:`([^`]*)`",
             lambda m: (
-                m.group(1).rsplit(".")[-1] if m.group(1)[0] == "~" else m.group(1)
+                "`"
+                + (m.group(1).rsplit(".")[-1] if m.group(1)[0] == "~" else m.group(1))
+                + "`"
             ),
             field.description,
             flags=re.MULTILINE,
