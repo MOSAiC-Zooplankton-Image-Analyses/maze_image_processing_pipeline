@@ -78,6 +78,7 @@ from .zoomie2 import DetectDuplicatesSimple
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
+
 class FilterEval(Node):
     """
     Filter the stream using a boolean expression.
@@ -338,18 +339,17 @@ def update_and_validate_sample_meta(data_root: PurePathBase, meta: Dict):
     return meta
 
 
-objid_pattern = "{object_date} {object_time}  {object_milliseconds}  {object_sequence:06d} {object_posx:04d} {object_posy:04d}"
-objid_parser = parse.compile(objid_pattern)
+object_id_fmt = "{object_date} {object_time}  {object_milliseconds}  {object_sequence:06d} {object_posx:04d} {object_posy:04d}"
+object_id_parser = parse.compile(object_id_fmt)
+object_frame_id_fmt = "{object_date} {object_time}  {object_milliseconds}"
 
 
 def parse_object_id(object_id, meta):
-    result = objid_parser.parse(object_id)
+    result = object_id_parser.parse(object_id)
     if result is None:
         raise ValueError(f"Can not parse object ID: {object_id}")
 
-    object_frame_id = "{object_date} {object_time}  {object_milliseconds}".format_map(
-        result.named
-    )
+    object_frame_id = object_frame_id_fmt.format_map(result.named)
 
     return {
         **meta,
@@ -612,7 +612,7 @@ def build_pytorch_segmentation(
         meta["object_width"] = x1 - x0
         meta["object_height"] = y1 - y0
 
-        meta["object_id"] = objid_pattern.format_map(meta)
+        meta["object_id"] = object_id_fmt.format_map(meta)
 
         meta["object_frac_invalid"] = (region.image_intensity[region.image] == 0).mean()
 
@@ -774,7 +774,7 @@ def build_input(
     output_config: EcoTaxaOutputConfig,
     meta: Variable,
     process_meta: Dict,
-    Progress: Type[Node]
+    Progress: Type[Node],
 ):
     # Insert input_meta into meta
     default_meta = input_config.default_meta
@@ -989,8 +989,8 @@ class MergeAnnotations(Node):
     def __init__(
         self,
         meta,
+        annotations: pd.DataFrame,
         *,
-        annotations_fn: str,
         min_overlap=0.5,
         min_validated_overlap=0.8,
     ):
@@ -1000,8 +1000,6 @@ class MergeAnnotations(Node):
 
         self.min_overlap = min_overlap
         self.min_validated_overlap = min_validated_overlap
-
-        annotations = read_tsv(annotations_fn)
 
         missing_columns = {
             "object_width",
@@ -1083,7 +1081,7 @@ class Runner(PipelineRunner):
         except pydantic.ValidationError as exc:
             logger.error(str(exc))
             return
-        
+
         if sys.stdout.isatty():
             Progress = LiveProgress
         else:
@@ -1111,7 +1109,7 @@ class Runner(PipelineRunner):
                 pipeline_config.output,
                 process_meta_var,
                 process_meta,
-                Progress
+                Progress,
             )
 
             Progress("Input objects")
@@ -1164,9 +1162,35 @@ class Runner(PipelineRunner):
                 logger.info(
                     f"Merging annotations: {postprocess_config.merge_annotations}"
                 )
-                meta = MergeAnnotations(
-                    meta, **postprocess_config.merge_annotations.model_dump()
+                merge_annotations_config = (
+                    postprocess_config.merge_annotations.model_dump()
                 )
+
+                annotations_fn = merge_annotations_config.pop("annotations_fn")
+                annotations: pd.DataFrame = read_tsv(annotations_fn)
+
+                if (
+                    "object_frame_id" not in annotations.columns
+                    and "object_id" in annotations.columns
+                ):
+
+                    def _extract_object_frame_id(object_id):
+                        result: parse.Result | None = object_id_parser.parse(object_id)  # type: ignore
+                        if result is None:
+                            raise ValueError(
+                                f"object_id {object_id} does not match pattern {object_id_parser.format}"
+                            )
+
+                        return object_frame_id_fmt.format_map(result.named)
+
+                    try:
+                        annotations["object_frame_id"] = annotations["object_id"].apply(
+                            _extract_object_frame_id
+                        )
+                    except Exception as exc:
+                        logger.warn(f"Could not guess object_frame_id: {exc}")
+
+                meta = MergeAnnotations(meta, annotations, **merge_annotations_config)
 
             # DEBUG: Slice
             if postprocess_config.slice is not None:

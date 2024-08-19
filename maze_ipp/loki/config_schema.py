@@ -201,14 +201,19 @@ class MergeAnnotationsConfig(DefaultModel):
     __default_field__ = "annotations_fn"
 
     annotations_fn: str = Field(
-        description="EcoTaxa TSV file containing annotations for objects."
+        description="EcoTaxa TSV file containing annotations for objects.\n"
+        "Required columns are object_width, object_height, object_posx and object_posy"
+        "(identifying the bounding box of an object) and object_frame_id (identifying "
+        "the frame that an object is part of).\n"
+        "For LOKI data, object_frame_id is usually the 'DDDDDDDD TTTTTT  ttt' part of the object_id.\n"
+        "If not present, object_frame_id is extracted from object_id."
     )
-    min_overlap: float | None = Field(
-        None,
+    min_overlap: float = Field(
+        0.5,
         description="Minimum overlap of object and annotation bounding box in IoU.",
     )
-    min_validated_overlap: float | None = Field(
-        None,
+    min_validated_overlap: float = Field(
+        0.8,
         description="Minimum overlap of object and annotation bounding so that the resulting annotation_status remains 'validated'.",
     )
 
@@ -277,4 +282,6 @@ class SegmentationPipelineConfig(BaseModel):
         description="Configuration of the post-processing."
     )
     output: EcoTaxaOutputConfig = Field(description="Configuration of the output.")
-    log_interval: str | float = Field("60s", description="The interval at which progress is logged, e.g. 10s or 1m.")
+    log_interval: str | float = Field(
+        "60s", description="The interval at which progress is logged, e.g. 10s or 1m."
+    )

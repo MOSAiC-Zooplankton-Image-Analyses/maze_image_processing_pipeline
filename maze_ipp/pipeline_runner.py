@@ -49,7 +49,7 @@ class PipelineRunner(abc.ABC):
         # warnings_logger.setLevel(logging.INFO)
 
         root_logger.info(
-            f"Loading pipeline config from {task_fn} ({task_fn_modified.isoformat(timespec='seconds')})"
+            f"Loading pipeline config from {task_fn} (last modified {task_fn_modified.isoformat(timespec='seconds')})"
         )
 
         # logging.getLogger("zoomie2").setLevel(logging.DEBUG)
