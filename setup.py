@@ -25,6 +25,7 @@ setup(
         "rich",
         "pydantic",
         "prefixed",
+        "pyyaml",
     ],
     # python_requires=">=3.7",
     # extras_require={

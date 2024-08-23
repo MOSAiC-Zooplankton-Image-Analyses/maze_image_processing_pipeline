@@ -91,7 +91,7 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
         )
 
         for line in f"[{modifier}] {description}".splitlines():
-            result.append(indent("\n".join(wrap(line)), "## "))
+            result.append(indent("\n".join(wrap(line, break_on_hyphens=False)), "## "))
         result.append(example)
 
     result.append("")

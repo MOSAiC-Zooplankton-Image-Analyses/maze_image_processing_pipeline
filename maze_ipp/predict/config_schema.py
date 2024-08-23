@@ -13,12 +13,16 @@ class EcoTaxaInputConfig(BaseModel):
         description="Ignore these directories. May contain wildcard characters ('?', '*').",
     )
     max_n_objects: int | None = Field(
-        None, description="Maximum number of objects. (For debugging.)"
+        None,
+        description="Maximum number of objects. (For debugging.)",
+        json_schema_extra={"debug": True},
     )
 
 
 class DataDescriptorSchema(BaseModel):
-    channels: Sequence[str] = Field(description="")
+    channel_names: Sequence[str] | None = Field(
+        None, description="List of channel names"
+    )
 
     model_config = ConfigDict(
         extra="allow",
@@ -73,6 +77,45 @@ class SegmentationConfig(TrueToDefaultsModel):
     draw: bool = Field(False, description="Draw segments.")
 
 
+class PolyTaxoConfig(BaseModel):
+    poly_taxonomy_fn: str = Field(description="PolyTaxonomy filename.")
+    ecotaxa_taxonomy_fn: str = Field(description="EcoTaxa project taxonomy filename.")
+    update_annotations: bool = Field(
+        True,
+        description="Update existing object_annotation_category with compatible predictions. "
+        "Incompatible predictions will not be added, even if they obtain higher scores than any compatible prediction.",
+    )
+    filter_validated: str | None = Field(
+        None,
+        description="Filter expression to apply to validated objects.\n"
+        "Objects not matching this filter are skipped.",
+    )
+    threshold: float = Field(
+        0.9,
+        description="Absolute threshold to apply to prediction scores. "
+        "Any accepted prediction must obtain a higher score than `threshold`. "
+        "If a score is below 1-threshold, a negative descriptor will be added to the description.",
+    )
+    threshold_relative: float = Field(
+        0.0,
+        description="Relative threshold to apply to prediction scores. Any accepted prediction must obtain a higher score than the next-best prediction's score + `threshold_relative`.",
+    )
+    taxonomy_augmentation_rules: OrderedDict[str, str] | None = Field(
+        None,
+        description="Augmentation rules to apply to previously validated annotations.\n"
+        "These rules enrich already validated annotations by incorporating implicit defaults "
+        "or taxonomic knowledge that could not be represented in EcoTaxa.",
+    )
+    prediction_constraint_rules: OrderedDict[str, str] | None = Field(
+        None,
+        description="Constraint rules to apply to predicted annotations.\n"
+        "These rules limit or exclude certain predictions based on contextual factors "
+        "or known exceptions within the taxonomy. "
+        "The purpose is to prevent inaccurate or inappropriate predictions "
+        "that do not align with known biological or taxonomic constraints.",
+    )
+
+
 class PredictionPipelineConfig(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -84,8 +127,16 @@ class PredictionPipelineConfig(BaseModel):
         description="Save raw predictions into an HDF5 file, e.g. for feature extraction or polytaxo classification.",
     )
     segmentation: SegmentationConfig | Literal[False] = Field(
-        None,
+        False,
         description="Measure predicted segments and store into EcoTaxa archive. (Only applies for semantic segmentation.)",
+    )
+    polytaxo: PolyTaxoConfig | Literal[False] = Field(
+        False,
+        description="Predict object properties using a PolyTaxo classifier and store into an EcoTaxa archive.",
     )
 
     target_dir: str = Field(description="Directory where the output files are created.")
+
+    log_interval: str | float = Field(
+        "60s", description="The interval at which progress is logged, e.g. 10s or 1m."
+    )
