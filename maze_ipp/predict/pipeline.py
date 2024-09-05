@@ -5,7 +5,8 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Collection, Dict, Mapping, Sequence
+import textwrap
+from typing import Any, Collection, Dict, List, Mapping, Sequence, Tuple
 
 import exceptiongroup
 import natsort
@@ -14,6 +15,7 @@ import pandas as pd
 import polytaxo
 import pydantic
 import skimage
+import skimage.color.colorlabel
 import skimage.util
 import torch
 import torchvision.transforms.functional as tvtf
@@ -52,54 +54,94 @@ def _find_files_glob(pattern: str, ignore_patterns: Collection | None = None):
 
 
 def measure_segments(
-    object_id: str, predictions: np.ndarray, channel_names: Sequence[str]
-) -> Mapping[str, Any]:
-    result: Dict[str, Any] = {"object_id": object_id}
-
+    meta: Dict[str, Any],
+    image: np.ndarray,
+    probabilities: np.ndarray,
+    channel_names: Sequence[str],
+    draw: bool,
+    _properties=["axis_major_length", "area_convex"],
+) -> Tuple[Mapping[str, Any], List]:
     # Make sure that predictions has the expected dtype and shape
     # assert np.issubdtype(
     #     predictions.dtype, np.integer
     # ), f"Expected integer, got {predictions.dtype}"
-    predictions = predictions.astype(int)
+    predictions = (probabilities > 0.5).astype(int)
     assert predictions.ndim == 3
     assert predictions.shape[-1] == len(channel_names)
 
-    for j, name in enumerate(channel_names):
-        area_predicted = predictions[..., j].sum()
+    if draw:
+        annotations = np.zeros(predictions.shape[:-1], dtype=int)
+        for i in range(predictions.shape[-1]):
+            annotations[predictions[..., i] > 0] = i + 1
 
-        result[f"{name}_area"] = area_predicted
+        colors = [
+            skimage.color.colorlabel._rgb_vector(c)
+            for c in skimage.color.colorlabel.DEFAULT_COLORS
+        ]
 
         try:
-            (props_predicted,) = regionprops(predictions[..., j])
-        except ValueError:
-            result[f"{name}_major_length"] = 0
-        else:
-            result[f"{name}_major_length"] = props_predicted.axis_major_length
-
-    return result
-
-
-def draw_segments(image: np.ndarray, predictions: np.ndarray):
-    # predictions shape: (H,W,C)
-    assert predictions.ndim == 3
-
-    annotations = np.zeros(predictions.shape[:-1], dtype=int)
-
-    for i in range(predictions.shape[-1]):
-        annotations[predictions[..., i] > 0] = i + 1
-
-    try:
-        return skimage.util.img_as_ubyte(
-            skimage.color.label2rgb(
+            annotated_image = skimage.color.colorlabel.label2rgb(
                 annotations, image, alpha=0.3, saturation=1, bg_color=None
             )
-        )
-    except Exception as exc:
-        add_note(
-            exc,
-            f"predictions.shape: {predictions.shape}, annotations.shape: {annotations.shape}, image.shape: {image.shape}",
-        )
-        raise
+        except Exception as exc:
+            add_note(
+                exc,
+                f"predictions.shape: {predictions.shape}, annotations.shape: {annotations.shape}, image.shape: {image.shape}",
+            )
+            raise
+    else:
+        annotated_image = None
+        colors = None
+
+    for j, channel_name in enumerate(channel_names):
+        area_predicted = predictions[..., j].sum()
+
+        meta[f"object_{channel_name}_area"] = area_predicted
+
+        try:
+            (props,) = regionprops(predictions[..., j])
+        except ValueError:
+            for prop in _properties:
+                meta[f"object_{channel_name}_{prop}"] = 0
+            meta[f"object_{channel_name}_area_convex_ratio"] = 0
+        else:
+            for prop in _properties:
+                meta[f"object_{channel_name}_{prop}"] = getattr(props, prop)
+
+            meta[f"object_{channel_name}_area_convex_ratio"] = (
+                (area_predicted / props.area_convex) if props.area_convex else 0
+            )
+
+            if annotated_image is not None:
+                centroid_r, centroid_c = props.centroid
+                vr = np.cos(props.orientation) * 0.5 * props.axis_major_length
+                r0, r1 = centroid_r + vr, centroid_r - vr
+                vc = np.sin(props.orientation) * 0.5 * props.axis_major_length
+                c0, c1 = centroid_c + vc, centroid_c - vc
+
+                max_r = annotated_image.shape[0] - 1
+                max_c = annotated_image.shape[1] - 1
+
+                rr, cc, val = skimage.draw.line_aa(
+                    round(r0.clip(0, max_r)),
+                    round(c0.clip(0, max_c)),
+                    round(r1.clip(0, max_r)),
+                    round(c1.clip(0, max_c)),
+                )
+                annotated_image[rr, cc] = (
+                    val[..., None] * colors[j] + (1 - val[..., None]) * annotated_image[rr, cc]  # type: ignore
+                )
+
+    return meta, (
+        []
+        if annotated_image is None
+        else [
+            (
+                meta["object_id"] + "_overlay.jpg",
+                skimage.util.img_as_ubyte(annotated_image),
+            )
+        ]
+    )
 
 
 def _prepare_translation(
@@ -226,7 +268,7 @@ def build_polytaxo_pipeline(
         meta: Dict,
         probabilities,
         *,
-        update_annotations=config.polytaxo.update_annotations,
+        compatible_predictions_only=config.polytaxo.compatible_predictions_only,
         filter_validated=filter_validated,
         threshold=config.polytaxo.threshold,
         threshold_relative=config.polytaxo.threshold_relative,
@@ -234,9 +276,10 @@ def build_polytaxo_pipeline(
         prediction_constraint_rules=prediction_constraint_rules,
         display_name_to_description=display_name_to_description,
         description_to_display_name=description_to_display_name,
+        skip_unchanged_objects=config.polytaxo.skip_unchanged_objects,
     ):
         if (
-            update_annotations
+            compatible_predictions_only
             and meta.get("object_annotation_status", "") == "validated"
         ):
             description_prev = display_name_to_description.at[
@@ -308,34 +351,58 @@ def build_polytaxo_pipeline(
             if not isinstance(q, polytaxo.NegatedRealNode)
         ]
 
-        # Lookup category_id for the description
+        # Lookup display_name for the description
         try:
             display_name = description_to_display_name.at[
                 str(description), "display_name"
             ]
         except KeyError as exc:
-            logger.error(f"Unknown description in taxonomy list: {exc}")
-            return None
-        else:
-            # Don't include in the output if we didn't change anything
-            if meta["object_annotation_category"] == display_name:
-                return None
+            qualifier_description = polytaxo.PolyDescription(poly_taxonomy.root).update(
+                description.qualifiers
+            )
+            matching_virtual = next(
+                (
+                    virtual
+                    for virtual in description.anchor.get_applicable_virtuals()
+                    if virtual.description == qualifier_description
+                ),
+                None,
+            )
+            if matching_virtual is not None:
+                msg = f"Consider creating '{description.anchor.name}>{matching_virtual.name}' on EcoTaxa."
+            else:
+                msg = f"Consider creating an appropriate morpho-taxon on EcoTaxa and adding it to the list of virtuals."
 
+            msg += f"\nOriginal description was: {description_prev} ({meta['object_annotation_category']})"
+            msg = textwrap.indent(msg, "  ")
+
+            logger.error(
+                f"Could not find description in EcoTaxa taxonomy: {exc}\n{msg}"
+            )
+
+            # Keep object_annotation_category unchanged
+            display_name = meta["object_annotation_category"]
+
+        if meta["object_annotation_category"] == display_name:
+            # Don't include in the output if we didn't change anything
+            if skip_unchanged_objects:
+                return None
+        else:
             meta.update(
                 object_annotation_category=display_name,
                 object_annotation_status="predicted",
             )
 
-            meta = {
-                k: v
-                for k, v in meta.items()
-                if k
-                in {
-                    "object_id",
-                    "object_annotation_category",
-                    "object_annotation_status",
-                }
+        meta = {
+            k: v
+            for k, v in meta.items()
+            if k
+            in {
+                "object_id",
+                "object_annotation_category",
+                "object_annotation_status",
             }
+        }
 
         return meta
 
@@ -365,6 +432,8 @@ class Runner(PipelineRunner):
                 log_interval = pd.Timedelta(log_interval).total_seconds()
 
             Progress = partial(LogProgress, log_interval=log_interval)
+
+        os.makedirs(config.target_dir, exist_ok=True)
 
         with Pipeline() as p:
             process_meta_var = Variable("process_meta", p)
@@ -398,7 +467,8 @@ class Runner(PipelineRunner):
             measurements_fn = Call(
                 lambda input_archive_fn: os.path.join(
                     config.target_dir,
-                    os.path.splitext(os.path.basename(input_archive_fn))[0] + ".zip",
+                    os.path.splitext(os.path.basename(input_archive_fn))[0]
+                    + ".segmentation.zip",
                 ),
                 input_archive_fn,
             )
@@ -474,7 +544,7 @@ class Runner(PipelineRunner):
             model = model.to(torch_dtype)
 
             def pre_transform(
-                img: np.ndarray, _center_crop=not config.model.tiled
+                img: np.ndarray, _center_crop=not config.model.tiling
             ) -> torch.Tensor:
                 """Ensure RGB image, convert to specified dtype and transpose."""
                 if img.ndim == 2:
@@ -497,12 +567,18 @@ class Runner(PipelineRunner):
                 return predictions.cpu().movedim(1, -1).numpy()
 
             with contextlib.ExitStack() as context_stack:
-                if config.model.tiled:
-                    tiled_pipeline = context_stack.enter_context(
-                        TiledPipeline((1024, 1024), image, tile_stride=(896, 896))
+                if config.model.tiling is not False:
+                    context_stack.enter_context(
+                        TiledPipeline(
+                            (config.model.tiling.size, config.model.tiling.size),
+                            image,
+                            tile_stride=(
+                                config.model.tiling.stride,
+                                config.model.tiling.stride,
+                            ),
+                            blend_strategy="linear",
+                        )
                     )
-                else:
-                    tiled_pipeline = None
 
                 if config.model.batch_size:
                     context_stack.enter_context(
@@ -529,18 +605,21 @@ class Runner(PipelineRunner):
                     # autocast=False,
                 )
 
-            if config.save_raw_predictions:
+            if config.save_raw_h5:
+                h5_mode_create = config.model.tiling
                 HDF5Writer(
                     predictions_fn,
-                    {
-                        "object_id": object_id,
-                        "predictions": predictions,
-                    },
-                    dataset_mode="append",
+                    (
+                        [(object_id, predictions)]
+                        if h5_mode_create
+                        else [("object_id", object_id), ("predictions", predictions)]
+                    ),
+                    dataset_mode="create" if h5_mode_create else "append",
+                    compression="gzip",
                 )
 
             if config.segmentation:
-                if not config.model.tiled:
+                if not config.model.tiling:
                     logger.warning(
                         "Segmentation is requested but tiling is not enabled."
                     )
@@ -548,23 +627,14 @@ class Runner(PipelineRunner):
                 if output_description.channel_names is None:
                     raise ValueError(f"Supply channel_names for output '{output_name}'")
 
-                meta = Call(
+                meta, fnames_images = Call(
                     measure_segments,
-                    object_id,
+                    et_obj.meta,
+                    image,
                     predictions,
                     output_description.channel_names,
-                )
-
-                fnames_images = []
-                if config.segmentation.draw:
-                    segment_image = Call(
-                        draw_segments,
-                        image,
-                        predictions,
-                    )
-                    fnames_images.append(
-                        (meta["object_id"] + "_overlay.png", segment_image)
-                    )
+                    config.segmentation.draw,
+                ).unpack(2)
 
                 EcotaxaWriter(measurements_fn, fnames_images, meta=meta)
 

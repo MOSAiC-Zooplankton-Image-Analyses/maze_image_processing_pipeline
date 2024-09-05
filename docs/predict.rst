@@ -36,7 +36,7 @@ The HDF5 file that is created will contain two datasets: `object_id` and `predic
 Polyhierarchical classification
 -------------------------------
 
-Polyhierarchical classification is implement as a two-step process: predicting scores for each image and generating polyhierarchical descriptions.
+Polyhierarchical classification works by predicting scores for each image, generating polyhierarchical descriptions and mapping them back to EcoTaxa categories.
 
 .. code-block:: python
     
@@ -47,8 +47,9 @@ Polyhierarchical classification is implement as a two-step process: predicting s
 .. TODO: Link model file
 
 :attr:`~maze_ipp.predict.config_schema.ModelConfig.model_fn` must point to a trained polytaxo classifier model.
+:attr:`~maze_ipp.predict.config_schema.PredictionPipelineConfig.polytaxo` must be configured.
 
-To generate polyhierarchical descriptions and, optionally, to map them back to EcoTaxa categories, the `polytaxo <https://github.com/MOSAiC-Zooplankton-Image-Analyses/polytaxo>`_ library can be used.
+For more information see the `polytaxo GitHub page <https://github.com/MOSAiC-Zooplankton-Image-Analyses/polytaxo>`_.
 
 
 Configuration Example

@@ -34,11 +34,19 @@ class ModelMetaSchema(BaseModel):
     #     description="Ordered mapping of input names to input descriptions."
     # )
     outputs: OrderedDict[str, DataDescriptorSchema] = Field(
-        description='Ordered mapping of output names to output descriptions, e.g. {"pred": ["Prosoma", "Oilsack"]}. Only a single output is supported.'
+        description='Ordered mapping of output names to output descriptions, e.g. {"pred": {"channel_names": ["Prosoma", "Oilsack"]}}. Only a single output is supported.'
     )
 
     model_config = ConfigDict(
         extra="allow",
+    )
+
+
+class TilingConfig(TrueToDefaultsModel):
+    size: int = Field(1024, description="Edge length of one tile")
+    stride: int = Field(
+        896,
+        description="Stride of the tiling. `size - stride` is the overlap of two consecutive tiles.",
     )
 
 
@@ -67,7 +75,7 @@ class ModelConfig(BaseModel):
 
     meta: ModelMetaSchema | None = Field(None, description="Model metadata.")
 
-    tiled: bool = Field(
+    tiling: TilingConfig | Literal[False] = Field(
         False,
         description="Apply the model to square tiles on each input image. Required for semantic segmentation.",
     )
@@ -80,10 +88,15 @@ class SegmentationConfig(TrueToDefaultsModel):
 class PolyTaxoConfig(BaseModel):
     poly_taxonomy_fn: str = Field(description="PolyTaxonomy filename.")
     ecotaxa_taxonomy_fn: str = Field(description="EcoTaxa project taxonomy filename.")
-    update_annotations: bool = Field(
+    compatible_predictions_only: bool = Field(
         True,
-        description="Update existing object_annotation_category with compatible predictions. "
-        "Incompatible predictions will not be added, even if they obtain higher scores than any compatible prediction.",
+        description="Update validated object_annotation_category with compatible predictions. "
+        "Incompatible predictions will not be added, even if they obtain higher scores than any compatible prediction.\n"
+        "If false, the prediction only depends on the model output.",
+    )
+    skip_unchanged_objects: bool = Field(
+        True,
+        description="Save only objects with updated annotations and skip unchanged objects.",
     )
     filter_validated: str | None = Field(
         None,
@@ -104,7 +117,9 @@ class PolyTaxoConfig(BaseModel):
         None,
         description="Augmentation rules to apply to previously validated annotations.\n"
         "These rules enrich already validated annotations by incorporating implicit defaults "
-        "or taxonomic knowledge that could not be represented in EcoTaxa.",
+        "or taxonomic knowledge that could not be represented in EcoTaxa.\n"
+        "These rules have the form `<query>: <update>`: "
+        "If the query expression matches the description, the update expression is applied.",
     )
     prediction_constraint_rules: OrderedDict[str, str] | None = Field(
         None,
@@ -112,7 +127,9 @@ class PolyTaxoConfig(BaseModel):
         "These rules limit or exclude certain predictions based on contextual factors "
         "or known exceptions within the taxonomy. "
         "The purpose is to prevent inaccurate or inappropriate predictions "
-        "that do not align with known biological or taxonomic constraints.",
+        "that do not align with known biological or taxonomic constraints.\n"
+        "These rules have the form `<query>: <update>`: "
+        "If the query expression matches the description, the update expression is applied.",
     )
 
 
@@ -122,9 +139,9 @@ class PredictionPipelineConfig(BaseModel):
     input: EcoTaxaInputConfig = Field(description="Configuration of the input.")
     model: ModelConfig = Field(description="Configuration of the input.")
 
-    save_raw_predictions: bool = Field(
+    save_raw_h5: bool = Field(
         False,
-        description="Save raw predictions into an HDF5 file, e.g. for feature extraction or polytaxo classification.",
+        description="Save raw predictions into an HDF5 file, e.g. for feature extraction.",
     )
     segmentation: SegmentationConfig | Literal[False] = Field(
         False,
