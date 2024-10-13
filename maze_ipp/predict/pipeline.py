@@ -79,6 +79,10 @@ def measure_segments(
     assert predictions.ndim == 3
     assert predictions.shape[-1] == len(channel_names)
 
+    # Calculate raw area (without hole-filling and component selection)
+    for c, channel_name in enumerate(channel_names):
+        meta[f"object_{channel_name}_raw_area"] = predictions[..., c].sum()
+
     # Fill holes
     if fill_holes:
         for c, channel_name in enumerate(channel_names):
