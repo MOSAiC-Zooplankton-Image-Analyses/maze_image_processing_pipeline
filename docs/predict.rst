@@ -1,8 +1,14 @@
 Prediction
 ==========
 
+The prediction module consumes EcoTaxa archive files and produces different kinds of output according to respective task.
+
 Semantic segmentation
 ---------------------
+
+The semantic segmentation task applies a PyTorch model for semantic segmentation to each input image
+and produces an EcoTaxa archive with the original metadata, the measurements and (optionally) the detected segments
+overlayed onto the original images.
 
 .. code-block:: python
     

@@ -1,4 +1,4 @@
-from typing import List, Literal, OrderedDict, Sequence
+from typing import List, Literal, OrderedDict, Sequence, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import TrueToDefaultsModel
@@ -83,6 +83,10 @@ class ModelConfig(BaseModel):
 
 class SegmentationConfig(TrueToDefaultsModel):
     draw: bool = Field(False, description="Draw segments.")
+    fill_holes: bool | Tuple[str, ...] = Field(
+        False,
+        description="Fill holes in segments. Can be boolean or a list of channel names.",
+    )
 
 
 class PolyTaxoConfig(BaseModel):

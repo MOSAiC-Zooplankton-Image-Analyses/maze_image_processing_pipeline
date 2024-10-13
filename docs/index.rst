@@ -1,5 +1,5 @@
-Welcome to MAZE-IPP's documentation!
-====================================
+MAZE Image Processing Pipeline
+==============================
 
 The MAZE Image Processing Pipeline (MAZE-IPP) is a comprehensive tool for advanced marine biological research, integrating three specialized modules to enhance zooplankton imagery analysis.
 Its command-line interface (CLI) provides two modules:

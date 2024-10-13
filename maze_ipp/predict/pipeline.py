@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import polytaxo
 import pydantic
+import pyecotaxa.archive
 import skimage
 import skimage.color.colorlabel
 import skimage.util
@@ -31,6 +32,8 @@ from morphocut.stream import Slice, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
 from skimage.measure import regionprops
+from skimage.measure._regionprops import RegionProperties
+import scipy.ndimage as ndi
 
 from ..common import add_note, convert_img_dtype, recursive_update
 from ..pipeline_runner import PipelineRunner
@@ -59,20 +62,47 @@ def measure_segments(
     probabilities: np.ndarray,
     channel_names: Sequence[str],
     draw: bool,
-    _properties=["axis_major_length", "area_convex"],
+    fill_holes: bool | Sequence[str] = False,
+    _properties=["area", "axis_major_length", "area_convex"],
 ) -> Tuple[Mapping[str, Any], List]:
-    # Make sure that predictions has the expected dtype and shape
-    # assert np.issubdtype(
-    #     predictions.dtype, np.integer
-    # ), f"Expected integer, got {predictions.dtype}"
-    predictions = (probabilities > 0.5).astype(int)
+
+    # Filter metadata keys to make sure that the archive is importable later
+    meta = {
+        k: v
+        for k, v in meta.items()
+        if k.split("_", maxsplit=1)[0] in pyecotaxa.archive.VALID_PREFIXES
+    }
+
+    # Convert probabilities to predictions
+    predictions = (probabilities > 0.5).astype(bool)
+
     assert predictions.ndim == 3
     assert predictions.shape[-1] == len(channel_names)
 
+    # Fill holes
+    if fill_holes:
+        for c, channel_name in enumerate(channel_names):
+            if fill_holes is True or channel_name in fill_holes:
+                regions: List[RegionProperties] = regionprops(predictions[..., c])
+                for r in regions:
+                    ndi.binary_fill_holes(r.image, output=predictions[..., c][r.slice])
+
+    # Keep only largest segment
+    for c, channel_name in enumerate(channel_names):
+        regions: List[RegionProperties] = regionprops(predictions[..., c])
+        if regions:
+            regions.sort(key=lambda r: r.area, reverse=True)
+            props = regions[0]
+            # Update predictions
+            predictions[..., c] = props._label_image == props.label
+        else:
+            props = None
+
+    # Draw segments
     if draw:
         annotations = np.zeros(predictions.shape[:-1], dtype=int)
-        for i in range(predictions.shape[-1]):
-            annotations[predictions[..., i] > 0] = i + 1
+        for c in range(predictions.shape[-1]):
+            annotations[predictions[..., c]] = c + 1
 
         colors = [
             skimage.color.colorlabel._rgb_vector(c)
@@ -93,14 +123,8 @@ def measure_segments(
         annotated_image = None
         colors = None
 
-    for j, channel_name in enumerate(channel_names):
-        area_predicted = predictions[..., j].sum()
-
-        meta[f"object_{channel_name}_area"] = area_predicted
-
-        try:
-            (props,) = regionprops(predictions[..., j])
-        except ValueError:
+    for c, channel_name in enumerate(channel_names):
+        if props is None:
             for prop in _properties:
                 meta[f"object_{channel_name}_{prop}"] = 0
             meta[f"object_{channel_name}_area_convex_ratio"] = 0
@@ -109,7 +133,7 @@ def measure_segments(
                 meta[f"object_{channel_name}_{prop}"] = getattr(props, prop)
 
             meta[f"object_{channel_name}_area_convex_ratio"] = (
-                (area_predicted / props.area_convex) if props.area_convex else 0
+                (props.area / props.area_convex) if props.area_convex else 0
             )
 
             if annotated_image is not None:
@@ -129,7 +153,7 @@ def measure_segments(
                     round(c1.clip(0, max_c)),
                 )
                 annotated_image[rr, cc] = (
-                    val[..., None] * colors[j] + (1 - val[..., None]) * annotated_image[rr, cc]  # type: ignore
+                    val[..., None] * colors[c] + (1 - val[..., None]) * annotated_image[rr, cc]  # type: ignore
                 )
 
     return meta, (
@@ -300,7 +324,7 @@ def build_polytaxo_pipeline(
         else:
             description_prev = None
 
-        description: polytaxo.PolyDescription = poly_taxonomy.parse_probabilities(
+        description: polytaxo.Description = poly_taxonomy.parse_probabilities(
             probabilities,
             baseline=description_prev,
             thr_pos_abs=threshold,
@@ -321,7 +345,7 @@ def build_polytaxo_pipeline(
             for q in description.descriptors
         )
         # Rebuild description to avoid duplicate qualifiers (because we use q.parent)
-        description = polytaxo.PolyDescription(poly_taxonomy.root).update(
+        description = polytaxo.Description(poly_taxonomy.root).update(
             d for d in _descriptors if d is not None
         )
         del _descriptors
@@ -357,9 +381,31 @@ def build_polytaxo_pipeline(
                 str(description), "display_name"
             ]
         except KeyError as exc:
-            qualifier_description = polytaxo.PolyDescription(poly_taxonomy.root).update(
+            # If the name is not found, suggest creating a new category
+
+            # Create a description that only includes the qualifiers (not the exact anchor)
+            qualifier_description = polytaxo.Description(poly_taxonomy.root).update(
                 description.qualifiers
             )
+
+            # # TODO: Select next best
+            # applicable_virtuals = description.anchor.get_applicable_virtuals()
+            # if description_prev is not None:
+            #     qualifier_description_prev = polytaxo.PolyDescription(
+            #         poly_taxonomy.root
+            #     ).update(description_prev.qualifiers)
+            #     # Select only virtuals that imply (are an extension of) the previous annotation
+            #     applicable_virtuals = [
+            #         v
+            #         for v in applicable_virtuals
+            #         if qualifier_description_prev <= v.description
+            #     ]
+            # # Calculate match score
+            # matching_virtuals = [
+            #     (v, sum(1 for d in qualifier_description.descriptors if d <= ))
+            #     for v in applicable_virtuals
+            # ]
+
             matching_virtual = next(
                 (
                     virtual
@@ -373,7 +419,9 @@ def build_polytaxo_pipeline(
             else:
                 msg = f"Consider creating an appropriate morpho-taxon on EcoTaxa and adding it to the list of virtuals."
 
-            msg += f"\nOriginal description was: {description_prev} ({meta['object_annotation_category']})"
+            if meta.get("object_annotation_status", "") == "validated":
+                msg += f"\nOriginal description was: {description_prev} ({meta['object_annotation_category']})"
+
             msg = textwrap.indent(msg, "  ")
 
             logger.error(
@@ -634,6 +682,7 @@ class Runner(PipelineRunner):
                     predictions,
                     output_description.channel_names,
                     config.segmentation.draw,
+                    config.segmentation.fill_holes,
                 ).unpack(2)
 
                 EcotaxaWriter(measurements_fn, fnames_images, meta=meta)
