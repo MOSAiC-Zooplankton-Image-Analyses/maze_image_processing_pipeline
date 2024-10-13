@@ -15,8 +15,10 @@ import pandas as pd
 import polytaxo
 import pydantic
 import pyecotaxa.archive
+import scipy.ndimage as ndi
 import skimage
 import skimage.color.colorlabel
+import skimage.measure
 import skimage.util
 import torch
 import torchvision.transforms.functional as tvtf
@@ -31,9 +33,7 @@ from morphocut.stream import Progress as LiveProgress
 from morphocut.stream import Slice, Unpack
 from morphocut.tiles import TiledPipeline
 from morphocut.torch import PyTorch
-from skimage.measure import regionprops
 from skimage.measure._regionprops import RegionProperties
-import scipy.ndimage as ndi
 
 from ..common import add_note, convert_img_dtype, recursive_update
 from ..pipeline_runner import PipelineRunner
@@ -87,20 +87,26 @@ def measure_segments(
     if fill_holes:
         for c, channel_name in enumerate(channel_names):
             if fill_holes is True or channel_name in fill_holes:
-                regions: List[RegionProperties] = regionprops(predictions[..., c])
-                for r in regions:
-                    ndi.binary_fill_holes(r.image, output=predictions[..., c][r.slice])
+                # Use ndi.find_objects to narrow down the area to be processed by ndi.binary_fill_holes
+                for slices in ndi.find_objects(predictions[..., c], 1):
+                    if slices is None:
+                        continue
+                    ndi.binary_fill_holes(
+                        predictions[..., c][slices], output=predictions[..., c][slices]
+                    )
 
     # Keep only largest segment
+    channel_props = {}
     for c, channel_name in enumerate(channel_names):
-        regions: List[RegionProperties] = regionprops(predictions[..., c])
+        labels = skimage.measure.label(predictions[..., c])
+        regions: List[RegionProperties] = skimage.measure.regionprops(labels)
         if regions:
             regions.sort(key=lambda r: r.area, reverse=True)
-            props = regions[0]
+            channel_props[channel_name] = props = regions[0]
             # Update predictions
             predictions[..., c] = props._label_image == props.label
         else:
-            props = None
+            channel_props[channel_name] = None
 
     # Draw segments
     if draw:
@@ -128,6 +134,8 @@ def measure_segments(
         colors = None
 
     for c, channel_name in enumerate(channel_names):
+        props = channel_props[channel_name]
+
         if props is None:
             for prop in _properties:
                 meta[f"object_{channel_name}_{prop}"] = 0
