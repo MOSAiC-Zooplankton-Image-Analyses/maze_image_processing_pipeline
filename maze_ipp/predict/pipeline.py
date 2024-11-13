@@ -194,7 +194,7 @@ def _prepare_translation(
                 parts, ignore_missing_intermediaries=True, with_alias=True
             )
         except ValueError as exc:
-            logger.warn(f"Could not parse lineage '{lineage}': {exc}")
+            logger.warning(f"Could not parse lineage '{lineage}': {exc}")
             return pd.Series([None, n_parts])
 
         return pd.Series([description, n_parts])
@@ -246,9 +246,11 @@ def _prepare_translation(
 
 
 def build_polytaxo_pipeline(
-    config: PredictionPipelineConfig, meta: Variable, probabilites: Variable
+    config: PredictionPipelineConfig, et_obj: Variable, probabilites: Variable
 ):
     assert config.polytaxo is not False
+
+    meta = et_obj.meta
 
     logger.info(
         f"Predicting object properties using PolyTaxonomy {config.polytaxo.poly_taxonomy_fn}."
@@ -313,7 +315,10 @@ def build_polytaxo_pipeline(
         display_name_to_description=display_name_to_description,
         description_to_display_name=description_to_display_name,
         skip_unchanged_objects=config.polytaxo.skip_unchanged_objects,
+        strip_metadata=config.polytaxo.strip_metadata,
     ):
+        meta.setdefault("object_annotation_category", "")
+
         if (
             compatible_predictions_only
             and meta.get("object_annotation_status", "") == "validated"
@@ -372,15 +377,10 @@ def build_polytaxo_pipeline(
         if description_prev is not None:
             description.add(description_prev)
 
-        # If cut or multiple, no other qualifiers shall be used
-        for q in description.qualifiers:
-            if isinstance(q, (polytaxo.PrimaryNode, polytaxo.TagNode)) and q.meta.get(
-                "singleton", False
-            ):
-                description.qualifiers = [q]
-                break
+        if config.polytaxo.save_raw_descriptions:
+            meta["object_polytaxo_description"] = str(description)
 
-        # Drop negated qualifiers
+        # Drop negated qualifiers (as these are not used on EcoTaxa)
         description.qualifiers = [
             q
             for q in description.qualifiers
@@ -453,16 +453,31 @@ def build_polytaxo_pipeline(
                 object_annotation_status="predicted",
             )
 
-        meta = {
-            k: v
-            for k, v in meta.items()
-            if k
-            in {
-                "object_id",
-                "object_annotation_category",
-                "object_annotation_status",
+        if strip_metadata:
+            # Keep only the specified fields
+            meta = {
+                k: v
+                for k, v in meta.items()
+                if k
+                in {
+                    "object_id",
+                    "object_annotation_category",
+                    "object_annotation_status",
+                    "object_polytaxo_description",
+                }
             }
-        }
+        else:
+            # Strip only previous annotation metadata
+            meta = {
+                k: v
+                for k, v in meta.items()
+                if not k.startswith("object_annotation_")
+                or k
+                in {
+                    "object_annotation_category",
+                    "object_annotation_status",
+                }
+            }
 
         return meta
 
@@ -700,22 +715,7 @@ class Runner(PipelineRunner):
                 EcotaxaWriter(measurements_fn, fnames_images, meta=meta)
 
             if config.polytaxo is not False:
-                # Extract relevant metadata
-                meta = Call(
-                    lambda et_obj: {
-                        k: v
-                        for k, v in et_obj.meta.items()
-                        if k
-                        in {
-                            "object_id",
-                            "object_annotation_status",
-                            "object_annotation_category",
-                            "object_annotation_hierarchy",
-                        }
-                    },
-                    et_obj,
-                )
-                meta = build_polytaxo_pipeline(config, meta, predictions)
+                meta = build_polytaxo_pipeline(config, et_obj, predictions)
                 EcotaxaWriter(polytaxo_fn, [], meta=meta)
 
         # Inject pipeline metadata into the stream

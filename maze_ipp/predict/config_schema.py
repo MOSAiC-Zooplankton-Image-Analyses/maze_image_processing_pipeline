@@ -107,6 +107,12 @@ class PolyTaxoConfig(BaseModel):
         description="Filter expression to apply to validated objects.\n"
         "Objects not matching this filter are skipped.",
     )
+    save_raw_descriptions: bool = Field(
+        False, description="Save raw description as meta-data."
+    )
+    strip_metadata: bool = Field(
+        True, description="Strip metadata unrelated to annotation."
+    )
     threshold: float = Field(
         0.9,
         description="Absolute threshold to apply to prediction scores. "
