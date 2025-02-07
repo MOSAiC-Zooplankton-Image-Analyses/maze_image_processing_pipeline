@@ -1,0 +1,3 @@
+morphocut @ git+https://github.com/morphocut/morphocut.git@03dbc6b7c41f557e6c3ced368dc345fea49d04c0
+polytaxo @ git+https://github.com/moi90/polytaxo.git@e94b154bc78d9be6b201e576fac79d5c66e6b689
+pyecotaxa @ git+https://github.com/moi90/pyecotaxa.git@dd5a2562773b85505959e50b28fde18ac948ac13
