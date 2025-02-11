@@ -29,21 +29,22 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
             union_types = [t for t in get_args(field.annotation) if t is not NoneType]
 
             union_examples = []
+            has_ellipsis_example = False
             for type_ in union_types:
                 if get_origin(type_) == Literal:
-                    union_examples.append(
-                        f"# {name}: {json.dumps(get_args(type_)[0])}\n"
-                    )
+                    union_examples.append(f"# {name}: {json.dumps(get_args(type_)[0])}")
                 elif get_origin(type_) is None and issubclass(type_, BaseModel):
                     union_examples.append(
                         f"# {name}:\n"
                         + indent(generate_yaml_example(type_, depth + 1), "#   "),
                     )
                 else:
-                    union_examples.append(f"# {name}: ...\n")
+                    if not has_ellipsis_example:
+                        union_examples.append(f"# {name}: ...")
+                        has_ellipsis_example = True
 
             return (
-                "# ## OR ##\n".join(union_examples),
+                "\n# ## OR ##\n".join(union_examples),
                 "optional",
             )
 
@@ -90,13 +91,15 @@ def generate_yaml_example(model: Type[BaseModel], depth=1) -> str:
             flags=re.MULTILINE,
         )
 
+        description_example = []
         for line in f"[{modifier}] {description}".splitlines():
-            result.append(indent("\n".join(wrap(line, break_on_hyphens=False)), "## "))
-        result.append(example)
+            description_example.append(
+                indent("\n".join(wrap(line, break_on_hyphens=False)), "## ")
+            )
+        description_example.append(example)
+        result.append("\n".join(description_example))
 
-    result.append("")
-
-    return "\n".join(result)
+    return "\n\n".join(result)
 
 
 class DefaultModel(BaseModel):
