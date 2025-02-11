@@ -743,19 +743,24 @@ def score_fn_simple(meta0, meta1):
     return overlap_xy
 
 
-def build_object_frame_id_filter(
-    valid_frame_id_fn: str | None, meta: Variable[Mapping]
-):
-    if valid_frame_id_fn is None:
+def build_object_frame_id_filter(valid_frames_fn: str | None, meta: Variable[Mapping]):
+    if valid_frames_fn is None:
         return
 
-    logger.info(f"Filtering object_frame_id from {valid_frame_id_fn}...")
+    valid_frames: pd.DataFrame = read_tsv(valid_frames_fn)
 
-    index = pd.Index(
-        pd.read_csv(valid_frame_id_fn, header=None, index_col=False).squeeze()
+    # Make sure we have an object_frame_id
+    valid_frames = ensure_object_frame_id(valid_frames)
+
+    # Build set of valid frame IDs
+    valid_frame_ids = set(valid_frames["object_frame_id"].unique())
+
+    logger.info(
+        f"Filtering objects from {valid_frames_fn} ({len(valid_frame_ids):,d} valid frame IDs)."
     )
 
-    Filter(lambda obj: obj[meta]["object_frame_id"] in index)
+    # Insert filter into pipeline
+    Filter(lambda obj: obj[meta]["object_frame_id"] in valid_frame_ids)
 
 
 def _find_files_glob(pattern: str, ignore_patterns: Collection | None = None):
@@ -899,7 +904,7 @@ def build_input(
     meta = Call(parse_object_id, object_id, meta)
 
     # Skip frames where no annotated objects exist (if configured)
-    build_object_frame_id_filter(input_config.valid_frame_id_fn, meta)
+    build_object_frame_id_filter(input_config.valid_frames_fn, meta)
 
     # DEBUG: Slice
     if input_config.slice is not None:
@@ -1073,6 +1078,32 @@ def filename_suffix(fn: str, suffix: str):
     return stem + suffix + ext
 
 
+def ensure_object_frame_id(data: pd.DataFrame):
+    if "object_frame_id" not in data.columns:
+        if "object_id" in data.columns:
+
+            def _extract_object_frame_id(object_id):
+                result: parse.Result | None = object_id_parser.parse(object_id)  # type: ignore
+                if result is None:
+                    raise ValueError(
+                        f"object_id {object_id} does not match pattern {object_id_parser.format}"
+                    )
+
+                return object_frame_id_fmt.format_map(result.named)
+
+            try:
+                data["object_frame_id"] = data["object_id"].apply(
+                    _extract_object_frame_id
+                )
+            except Exception as exc:
+                logger.warning(f"Could not guess object_frame_id: {exc}")
+
+        else:
+            raise ValueError("object_frame_id and object_id are both missing.")
+
+    return data
+
+
 class Runner(PipelineRunner):
     @staticmethod
     def _configure_and_run(config_dict):
@@ -1169,26 +1200,8 @@ class Runner(PipelineRunner):
                 annotations_fn = merge_annotations_config.pop("annotations_fn")
                 annotations: pd.DataFrame = read_tsv(annotations_fn)
 
-                if (
-                    "object_frame_id" not in annotations.columns
-                    and "object_id" in annotations.columns
-                ):
-
-                    def _extract_object_frame_id(object_id):
-                        result: parse.Result | None = object_id_parser.parse(object_id)  # type: ignore
-                        if result is None:
-                            raise ValueError(
-                                f"object_id {object_id} does not match pattern {object_id_parser.format}"
-                            )
-
-                        return object_frame_id_fmt.format_map(result.named)
-
-                    try:
-                        annotations["object_frame_id"] = annotations["object_id"].apply(
-                            _extract_object_frame_id
-                        )
-                    except Exception as exc:
-                        logger.warn(f"Could not guess object_frame_id: {exc}")
+                # Make sure we have an object_frame_id
+                annotations = ensure_object_frame_id(annotations)
 
                 meta = MergeAnnotations(meta, annotations, **merge_annotations_config)
 
@@ -1201,10 +1214,10 @@ class Runner(PipelineRunner):
 
             if postprocess_config.filter_expr is not None:
                 logger.info(
-                    f"Filtering output by expression {output_config.filter_expr!r}"
+                    f"Filtering output by expression {postprocess_config.filter_expr!r}"
                 )
 
-                FilterEval(output_config.filter_expr, meta)
+                FilterEval(postprocess_config.filter_expr, meta)
 
             ## Output
             output_config = pipeline_config.output

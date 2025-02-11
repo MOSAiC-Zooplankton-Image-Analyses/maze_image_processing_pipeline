@@ -40,3 +40,12 @@ This is the complete documentation for the configuration of the pipeline:
 .. automodule:: maze_ipp.loki.config_schema
    :exclude-members: DefaultModel, TrueToDefaultsModel
    :members:
+
+
+Merging existing annotations
+----------------------------
+
+In the case of reprocessing, it is sometimes necessary to merge existing annotations into the new dataset.
+These can be extracted from an EcoTaxa export using the `pyecotaxa extract-meta` helper command:
+
+   pyecotaxa extract-meta --fix-bbox LOKI <INPUT_ARCH_FN> <OUTPUT_TSV_FN>

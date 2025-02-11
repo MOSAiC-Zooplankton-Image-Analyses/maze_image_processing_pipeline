@@ -176,10 +176,12 @@ class LokiInputConfig(BaseModel):
     )
 
     default_meta: Dict = Field({}, description="Default metadata for all objects.")
-    valid_frame_id_fn: str | None = Field(
+    valid_frames_fn: str | None = Field(
         None,
-        description="Location of a file containing all valid `object_frame_id` s. "
-        "Frames not in this file will be skipped. (Optional.)",
+        description="EcoTaxa TSV file containing valid frame IDs.\n"
+        "Input frames with no corresponding objects in this file will be skipped.\n"
+        "For LOKI data, object_frame_id is usually the 'DDDDDDDD TTTTTT  ttt' part of the object_id.\n"
+        "If not present, object_frame_id is extracted from object_id.",
     )
     merge_telemetry: MergeTelemetryConfig | Literal[False] = Field(
         default_factory=MergeTelemetryConfig,
