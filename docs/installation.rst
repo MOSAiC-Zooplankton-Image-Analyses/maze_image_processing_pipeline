@@ -2,6 +2,7 @@ Installation
 ============
 
 .. code:: sh
+   
    # Clone the project repository
    git clone https://github.com/MOSAiC-Zooplankton-Image-Analyses/maze_image_processing_pipeline.git
 
